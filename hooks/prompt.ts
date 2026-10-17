@@ -13,8 +13,13 @@ import { texToUnicode, type Macros } from './unicode'
 
 // A draft longer than this is left unpainted: every key would scan it.
 const MAX_DRAFT_CHARS = 20_000
-// The longest preview drawn after a formula.
+// The longest preview drawn after a formula, and the longest formula
+// previewed at all.
 const MAX_PREVIEW_CHARS = 120
+const MAX_PREVIEWED_TEX = 2_000
+// A line longer than this gets no emphasis: finding unclosed markers on it
+// costs time on every key.
+const MAX_EMPHASIS_LINE = 2_000
 const FENCE_RE = /^ {0,3}(```+|~~~+)/
 // Bold, italic, strikethrough and links on one line. Code spans and math are
 // read by `scan` first, so nothing here looks inside them.
@@ -71,7 +76,7 @@ export function promptDecorations(text: string, style: MarkdownStyle, macros?: M
         marker(end - ticks / 2, end)
       } else {
         paint(at, end, { color: style.math })
-        const preview = texToUnicode(segment.tex, macros)
+        const preview = segment.tex.length > MAX_PREVIEWED_TEX ? '' : previewOf(segment.tex, macros)
         if (preview && preview !== segment.tex.trim()) {
           const shown = [...preview].length > MAX_PREVIEW_CHARS ? `${[...preview].slice(0, MAX_PREVIEW_CHARS).join('')}…` : preview
           paint(end, end, { virtualText: ` → ${shown}`, color: style.math, italic: true })
@@ -81,6 +86,25 @@ export function promptDecorations(text: string, style: MarkdownStyle, macros?: M
     }
   }
   return out
+}
+
+// Each key repaints the whole draft, so the formulas already in it are
+// converted once and remembered, for the macros they were converted with.
+const previews = new Map<string, string>()
+let previewMacros: Macros | undefined
+
+function previewOf(tex: string, macros?: Macros): string {
+  if (macros !== previewMacros) {
+    previews.clear()
+    previewMacros = macros
+  }
+  let preview = previews.get(tex)
+  if (preview === undefined) {
+    if (previews.size >= 500) previews.clear()
+    preview = texToUnicode(tex, macros)
+    previews.set(tex, preview)
+  }
+  return preview
 }
 
 type Paint = (start: number, end: number, look: Omit<PromptDecoration, 'start' | 'end'>) => void
@@ -124,6 +148,14 @@ function lineStyle(line: string, start: number, end: number, style: MarkdownStyl
 }
 
 function emphasis(text: string, offset: number, style: MarkdownStyle, paint: Paint, marker: (s: number, e: number) => void): void {
+  let at = 0
+  for (const line of text.split('\n')) {
+    if (line.length <= MAX_EMPHASIS_LINE) emphasisOfLine(line, offset + at, style, paint, marker)
+    at += line.length + 1
+  }
+}
+
+function emphasisOfLine(text: string, offset: number, style: MarkdownStyle, paint: Paint, marker: (s: number, e: number) => void): void {
   for (const m of text.matchAll(EMPHASIS_RE)) {
     const start = offset + m.index!
     const end = start + m[0].length

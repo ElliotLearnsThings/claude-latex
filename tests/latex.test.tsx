@@ -97,6 +97,14 @@ test('reads formulas left to right, and leaves code spans alone', async $ => {
   await ui.unmount()
 })
 
+test('a dollar inside a code span never closes a formula', async $ => {
+  const text = 'This costs $5 and $10, and `$HOME` stays code. Then $x^2$.'
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply(text) })
+  expect((await ui.findAll({ type: 'Svg' })).map(svg => String(svg.props.alt))).toEqual(['x^2'])
+  expect(await ui.find({ type: 'Text', text: /\$HOME/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a macro defined in one formula does not reach the next', async $ => {
   const text = 'First $\\renewcommand{\\alpha}{\\text{changed}}\\alpha$ then $\\alpha$.'
   const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply(text) })

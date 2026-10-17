@@ -58,7 +58,9 @@ export type Segment =
 // The closing $ of an inline formula that opens just before `start`, or -1.
 // The rules keep money as money: no space just inside either dollar, no
 // digit straight after the closing one, and no line break inside. A $ inside
-// braces belongs to the formula, as in \text{if $x>0$}.
+// braces belongs to the formula, as in \text{if $x>0$}. A code span is
+// never cut by a formula: in `$5 and $10, and \`$HOME\``, the second dollar
+// would close at the one inside the code span, so it does not open one.
 function closeInline(text: string, start: number): number {
   const first = text[start]
   if (first === undefined || first === '$' || /\s/.test(first)) return -1
@@ -69,7 +71,12 @@ function closeInline(text: string, start: number): number {
   for (let j = start; j < text.length; j++) {
     const c = text[j]
     if (c === '\n') break
-    if (c === '\\') j += 1
+    if (c === '`') {
+      let ticks = 1
+      while (text[j + ticks] === '`') ticks += 1
+      if (closeCode(text, j + ticks, ticks) >= 0) return -1
+      j += ticks - 1
+    } else if (c === '\\') j += 1
     else if (c === '{') depth += 1
     else if (c === '}') depth = Math.max(0, depth - 1)
     else if (c === '$') {

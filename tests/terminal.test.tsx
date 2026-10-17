@@ -115,3 +115,49 @@ test('the prompt box setting turns the paint off', { options: { promptBox: false
   const edited = await edit($, { origin: { kind: 'composer' }, text: 'see $x^2', cursor: 8, start: 8, end: 8, inputText: '$' })
   expect(edited.decorations ?? []).toEqual([])
 })
+
+test('a macro that calls itself, or nests without end, is shown as written in good time', () => {
+  const started = Date.now()
+  expect(texToUnicode('\\a', readMacros('\\newcommand{\\a}{\\a\\a\\a\\a\\a\\a\\a\\a\\a\\a}'))).toBe('\\a')
+  expect(texToUnicode('\\f{x}', readMacros('\\newcommand{\\f}[1]{\\f{#1}\\f{#1}\\f{#1}\\f{#1}}'))).toBe('\\f{x}')
+  expect(texToUnicodeLines('\\frac{'.repeat(3000))).toHaveLength(1)
+  expect(texToUnicodeLines(`\\begin{align}${Array.from({ length: 300 }, () => 'a &= b').join('\\\\')}\\end{align}`)).toHaveLength(300)
+  expect(Date.now() - started).toBeLessThan(2000)
+})
+
+test('reads the macros a formula defines, and keeps \\\\ a row break', () => {
+  expect(texToUnicode('\\newcommand{\\R}{\\mathbb{R}} x \\in \\R')).toBe('x ∈ ℝ')
+  expect(texToUnicode('\\DeclareMathOperator{\\Tr}{Tr} \\Tr A')).toBe('Tr A')
+  expect(texToUnicodeLines('a \\\\ \\d b', readMacros('\\newcommand{\\d}{\\mathrm{d}}'))).toEqual(['a', 'db'])
+  expect(texToUnicode('x^\\half', readMacros('\\newcommand{\\half}{\\frac12}'))).toBe('x^½')
+})
+
+test('keeps fractions, relations and stacked operators apart from their neighbours', () => {
+  expect(texToUnicode('\\frac{a}{b}c')).toBe('(a/b)c')
+  expect(texToUnicode('i\\hbar\\frac{\\partial}{\\partial t}\\Psi')).toBe('iℏ(∂/∂t)Ψ')
+  expect(texToUnicode('x = \\frac{a}{b}')).toBe('x = a/b')
+  expect(texToUnicodeLines('\\frac{a}{b}\\frac{c}{d}')).toEqual([' a   c', '─── ───', ' b   d'])
+  expect(texToUnicode('x := 5')).toBe('x := 5')
+  expect(texToUnicodeLines('\\sum_{i=1}^{n} \\sum_{j=1}^{m} a_{ij}')).toEqual([' n   m', ' ∑   ∑ aᵢⱼ', 'i=1 j=1'])
+  expect(texToUnicode('n \\choose k')).toBe('C(n, k)')
+  expect(texToUnicode('x \\foo y')).toBe('x\\foo y')
+  expect(texToUnicode('\\dv{x}')).toBe('d/dx')
+  expect(texToUnicode('\\qty(\\frac{f(x)}{2})')).toBe('(f(x)/2)')
+  expect(texToUnicode('a \\overset{def}{=} b')).toBe('a =ᵈᵉᶠ b')
+  expect(texToUnicode('\\underbrace{a+b}_{n}')).toBe('(a + b)ₙ')
+  expect(texToUnicode('a \\not')).toBe('a')
+})
+
+test('a display formula wider than the terminal is drawn on one line', async $ => {
+  const wide = `$$${Array.from({ length: 30 }, (_, i) => `\\frac{a_{${i}}}{b}`).join(' + ')}$$`
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'terminal', component: 'AssistantMessage', props: reply(wide), viewport: { columns: 60, rows: 40 } } as never)
+  const text = (await ui.find({ type: 'Text', text: /a₀/ }))?.text ?? ''
+  expect(text).not.toContain('\n')
+  await ui.unmount()
+})
+
+test('a link in a terminal line keeps its address', async $ => {
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'terminal', component: 'AssistantMessage', props: reply('See [the docs](https://example.com/a) for $x^2$.') })
+  expect(await ui.find({ type: 'Link' })).toEqual(expect.objectContaining({ props: expect.objectContaining({ href: 'https://example.com/a' }) }))
+  await ui.unmount()
+})

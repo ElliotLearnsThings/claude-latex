@@ -17,12 +17,14 @@ type Box = { lines: string[]; base: number }
 type Mode = 'display' | 'inline' | 'script'
 
 // The width of a text in terminal cells: combining marks take none, wide
-// East Asian characters take two.
+// East Asian characters (Hangul Jamo, CJK, full-width forms) take two.
+const WIDE_RANGES: [number, number][] = [[0x1100, 0x115f], [0x2e80, 0xa4cf], [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe30, 0xfe4f], [0xff00, 0xff60], [0xffe0, 0xffe6]]
 export function cellWidth(text: string): number {
+  if (/^[ -~]*$/.test(text)) return text.length
   let width = 0
-  for (const ch of text) {
-    if (/\p{M}/u.test(ch)) continue
-    width += /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/.test(ch) ? 2 : 1
+  for (const ch of text.replace(/\p{M}/gu, '')) {
+    const code = ch.codePointAt(0)!
+    width += WIDE_RANGES.some(([from, to]) => code >= from && code <= to) ? 2 : 1
   }
   return width
 }
@@ -45,16 +47,10 @@ function hcat(boxes: Box[]): Box {
   if (parts.every(isFlat)) return textBox(parts.map(b => b.lines[0]).join(''))
   const above = Math.max(...parts.map(b => b.base))
   const below = Math.max(...parts.map(b => b.lines.length - 1 - b.base))
+  const widths = parts.map(boxWidth)
   const lines: string[] = []
   for (let row = 0; row <= above + below; row++) {
-    lines.push(
-      parts
-        .map(b => {
-          const width = boxWidth(b)
-          return padRight(b.lines[row - (above - b.base)] ?? '', width)
-        })
-        .join(''),
-    )
+    lines.push(parts.map((b, n) => padRight(b.lines[row - (above - b.base)] ?? '', widths[n]!)).join(''))
   }
   return { lines, base: above }
 }
@@ -173,14 +169,16 @@ const DROP_WITH_ARG = new Set(['label', 'hphantom', 'phantom', 'vspace', 'color'
 // Accents: a combining mark after the character. Wide ones go over every
 // character of their argument.
 const ACCENTS: Record<string, string> = {
-  hat: '̂', widehat: '̂', check: '̌', widecheck: '̌', tilde: '̃',
-  widetilde: '̃', acute: '́', grave: '̀', dot: '̇', ddot: '̈',
-  dddot: '⃛', breve: '̆', bar: '̄', vec: '⃗', mathring: '̊',
-  overline: '̅', underline: '̲', overrightarrow: '⃗', overleftarrow: '⃖',
-  utilde: '̰', underbar: '̲', cancel: '̶', bcancel: '̶', xcancel: '̶',
-  sout: '̶', overleftrightarrow: '⃡',
+  hat: '\u0302', widehat: '\u0302', check: '\u030c', widecheck: '\u030c', tilde: '\u0303',
+  widetilde: '\u0303', acute: '\u0301', grave: '\u0300', dot: '\u0307', ddot: '\u0308',
+  dddot: '\u20db', breve: '\u0306', bar: '\u0304', vec: '\u20d7', mathring: '\u030a',
+  overline: '\u0305', underline: '\u0332', overrightarrow: '\u20d7', overleftarrow: '\u20d6',
+  utilde: '\u0330', underbar: '\u0332', cancel: '\u0336', bcancel: '\u0336', xcancel: '\u0336',
+  sout: '\u0336', overleftrightarrow: '\u20e1',
 }
 const WIDE_ACCENTS = new Set(['widehat', 'widetilde', 'widecheck', 'overline', 'underline', 'overrightarrow', 'overleftarrow', 'cancel', 'bcancel', 'xcancel', 'sout', 'underbar', 'utilde', 'overleftrightarrow'])
+
+const RELATION_GLYPHS = new Set([...Object.values(REL), '=', '<', '>', ':'])
 
 const NEGATED: Record<string, string> = {
   '=': '≠', '∈': '∉', '⊂': '⊄', '⊃': '⊅', '⊆': '⊈', '⊇': '⊉', '<': '≮', '>': '≯', '≤': '≰',
@@ -362,59 +360,103 @@ export function readMacros(src: string, into: Macros = new Map()): Macros {
   return into
 }
 
+// How far macros may expand, as MathJax limits it: past either bound the
+// formula is shown as written. A macro that calls itself would otherwise
+// grow without end, and this runs on every key typed in the prompt box.
+const MAX_EXPANSIONS = 1000
+const MAX_EXPANDED_CHARS = 50_000
+
+// Expands macros left to right, as TeX does: each expansion is read again
+// ahead of the rest. `\\` is a row break, never a macro named after it.
 function expandMacros(src: string, macros: Macros): string {
   if (macros.size === 0) return src
-  let out = src
-  // Each pass expands one level; a macro that expands into itself stops here.
-  for (let pass = 0; pass < 8; pass++) {
-    let changed = false
-    out = out.replace(/\\([a-zA-Z]+)/g, (whole, name: string, offset: number, all: string) => {
-      const macro = macros.get(name)
-      if (!macro || macro.args > 0) return whole
-      changed = true
-      // Keep a following letter from joining the expansion's last command.
-      return /[a-zA-Z]/.test(all[offset + whole.length] ?? '') ? `{${macro.body}}` : macro.body
-    })
-    // Macros with arguments: read each braced or single-token argument.
-    let result = ''
-    let i = 0
-    const re = /\\([a-zA-Z]+)/g
-    for (let m = re.exec(out); m; m = re.exec(out)) {
-      const macro = macros.get(m[1]!)
-      if (!macro || macro.args === 0) continue
-      let j = m.index + m[0].length
-      const args: string[] = []
-      for (let k = 0; k < macro.args; k++) {
-        while (out[j] === ' ') j += 1
-        const group = groupAt(out, j)
-        if (group) {
-          args.push(group.text)
-          j = group.end
-        } else if (out[j] === '\\') {
-          const cmd = /^\\([a-zA-Z]+|.)/.exec(out.slice(j))![0]
-          args.push(cmd)
-          j += cmd.length
-        } else if (j < out.length) {
-          args.push(out[j]!)
-          j += 1
-        }
-      }
-      result += out.slice(i, m.index) + `{${macro.body.replace(/#(\d)/g, (_, n: string) => args[Number(n) - 1] ?? '')}}`
-      i = j
-      re.lastIndex = j
-      changed = true
+  let out = ''
+  let rest = src
+  let expansions = 0
+  const re = /\\([a-zA-Z]+)|\\[^a-zA-Z]/
+  for (let m = re.exec(rest); m; m = re.exec(rest)) {
+    out += rest.slice(0, m.index)
+    const macro = m[1] === undefined ? undefined : macros.get(m[1])
+    let j = m.index + m[0].length
+    if (!macro) {
+      out += m[0]
+      rest = rest.slice(j)
+      continue
     }
-    out = result + out.slice(i)
-    if (!changed) break
+    if (++expansions > MAX_EXPANSIONS) throw new Error('too many macro expansions')
+    const args: string[] = []
+    for (let k = 0; k < macro.args; k++) {
+      while (rest[j] === ' ') j += 1
+      const group = groupAt(rest, j)
+      if (group) {
+        args.push(group.text)
+        j = group.end
+      } else if (rest[j] === '\\') {
+        const cmd = /^\\([a-zA-Z]+|.)/.exec(rest.slice(j))![0]
+        args.push(cmd)
+        j += cmd.length
+      } else if (j < rest.length) {
+        args.push(rest[j]!)
+        j += 1
+      }
+    }
+    const body = macro.body.replace(/#(\d)/g, (_, n: string) => args[Number(n) - 1] ?? '')
+    const after = rest.slice(j)
+    // Keep a letter that follows from joining the body's last command.
+    const joiner = /\\[a-zA-Z]+$/.test(body) && /^[a-zA-Z]/.test(after) ? ' ' : ''
+    rest = body + joiner + after
+    if (out.length + rest.length > MAX_EXPANDED_CHARS) throw new Error('macros expand too far')
   }
-  return out
+  return out + rest
+}
+
+// The formula without the definitions in it, which readMacros has taken.
+function stripDefinitions(src: string): string {
+  const re = /\\(?:(?:re)?newcommand\*?|providecommand\*?|DeclareMathOperator\*?|def)(?![a-zA-Z])/g
+  let out = ''
+  let i = 0
+  for (let m = re.exec(src); m; m = re.exec(src)) {
+    out += src.slice(i, m.index)
+    i = m.index + definitionLength(src.slice(m.index))
+    re.lastIndex = i
+  }
+  return out + src.slice(i)
 }
 
 // ---------------------------------------------------------------------------
 // The converter
 
+// Past these a formula is shown as written: the longest formula converted,
+// and how deep groups may nest. Both keep a pathological formula from
+// costing seconds on a key press.
+const MAX_FORMULA_CHARS = 20_000
+const MAX_DEPTH = 60
+
 type Kind = 'ord' | 'bin' | 'rel' | 'op' | 'open' | 'close' | 'punct' | 'space'
-type Item = { box: Box; kind: Kind; limits?: boolean; hasScripts?: boolean }
+// `isFraction`: a fraction written on one line, a/b, which needs brackets
+// when something stands right beside it: (a/b)c, not a/bc.
+type Item = { box: Box; kind: Kind; limits?: boolean; hasScripts?: boolean; isFraction?: boolean }
+
+// Whether a box's own row, the one it lines up on, is blank at an edge.
+function baseBlank(box: Box, side: 'left' | 'right'): boolean {
+  const line = padRight(box.lines[box.base] ?? '', boxWidth(box))
+  return side === 'left' ? line.startsWith(' ') : line.endsWith(' ')
+}
+
+// Whether every row of a box is blank at its left or right edge, so a space
+// beside it would double one already there.
+function blankEdge(box: Box, side: 'left' | 'right'): boolean {
+  const width = boxWidth(box)
+  return box.lines.every(line => (side === 'left' ? line.startsWith(' ') : cellWidth(line) < width || line.endsWith(' ')))
+}
+
+// The arguments commands take, so that `x^\frac12` reads `\frac12` whole as
+// its superscript, as TeX does.
+const ARITY: Record<string, number> = {
+  frac: 2, dfrac: 2, tfrac: 2, cfrac: 2, binom: 2, dbinom: 2, tbinom: 2, sqrt: 1, mathbb: 1, mathbf: 1,
+  mathcal: 1, mathrm: 1, mathit: 1, mathsf: 1, mathfrak: 1, boldsymbol: 1, bm: 1, text: 1, hat: 1,
+  bar: 1, vec: 1, tilde: 1, dot: 1, ddot: 1, overline: 1, operatorname: 1,
+}
 
 // Splits a body at top-level `\\` into rows and each row at `&` into cells.
 function splitRows(body: string): string[][] {
@@ -468,7 +510,10 @@ class Converter {
     private src: string,
     private mode: Mode,
     private macros: Macros,
-  ) {}
+    private depth = 0,
+  ) {
+    if (depth > MAX_DEPTH) throw new Error('nested too deep')
+  }
 
   run(): Box {
     const box = this.sequence(null)
@@ -477,7 +522,27 @@ class Converter {
   }
 
   private sub(src: string, mode: Mode): Box {
-    return new Converter(src, mode, this.macros).run()
+    return new Converter(src, mode, this.macros, this.depth + 1).run()
+  }
+
+  // Where each { closes, worked out once for the whole formula: reading each
+  // group by scanning ahead was quadratic on a formula of unclosed braces.
+  private closes: Int32Array | null = null
+  // How deep the groups being read nest in this formula.
+  private groups = 0
+
+  private closingBrace(open: number): number {
+    if (!this.closes) {
+      this.closes = new Int32Array(this.src.length).fill(-1)
+      const stack: number[] = []
+      for (let j = 0; j < this.src.length; j++) {
+        const c = this.src[j]
+        if (c === '\\') j += 1
+        else if (c === '{') stack.push(j)
+        else if (c === '}' && stack.length) this.closes[stack.pop()!] = j
+      }
+    }
+    return this.closes[open] ?? -1
   }
 
   private get flat(): boolean {
@@ -496,10 +561,11 @@ class Converter {
   // A raw argument: the braced group's text, or one token.
   private rawArg(): string {
     this.skipSpace()
-    const group = groupAt(this.src, this.i)
-    if (group) {
-      this.i = group.end
-      return group.text
+    const close = this.src[this.i] === '{' ? this.closingBrace(this.i) : -1
+    if (close >= 0) {
+      const text = this.src.slice(this.i + 1, close)
+      this.i = close + 1
+      return text
     }
     const cmd = /^\\([a-zA-Z]+|.)/.exec(this.src.slice(this.i))
     if (cmd) {
@@ -535,28 +601,49 @@ class Converter {
   // Reads atoms up to `stop` (a closing `}`, or `\right` for a \left), and
   // lays them out with TeX's spacing between them.
   private sequence(stop: '}' | 'right' | null): Box {
-    const items: Item[] = []
+    let items: Item[] = []
+    // `a \over b`, `n \choose k`, `a \atop b`: what came before in the group
+    // is the top.
+    let infix: { name: string; top: Item[] } | null = null
     while (this.i < this.src.length) {
       if (stop === '}' && this.src[this.i] === '}') {
         this.i += 1
         break
       }
       if (stop === 'right' && this.src.startsWith('\\right', this.i) && !/[a-zA-Z]/.test(this.src[this.i + 6] ?? '')) break
+      const word = /^\\(over|choose|atop|brack|brace)(?![a-zA-Z])/.exec(this.src.slice(this.i))
+      if (word && !infix) {
+        infix = { name: word[1]!, top: items }
+        items = []
+        this.i += word[0].length
+        continue
+      }
       const item = this.atom()
       if (!item) continue
       this.scripts(item)
       items.push(item)
     }
-    return this.join(items)
+    if (!infix) return this.join(items)
+    const top = this.join(infix.top)
+    const bottom = this.join(items)
+    if (infix.name === 'over') return this.fractionOf(top, bottom).box
+    return this.binomialOf(top, bottom, infix.name === 'choose' ? ['(', ')'] : infix.name === 'brack' ? ['[', ']'] : infix.name === 'brace' ? ['{', '}'] : ['', ''])
   }
 
   private join(items: Item[]): Box {
     const spaced = this.mode !== 'script'
     const parts: Box[] = []
+    const gap = textBox(' ')
+    const space = () => {
+      if (parts[parts.length - 1] !== gap) parts.push(gap)
+    }
     const visible = items.filter(item => !(item.kind === 'space' && item.box.lines[0] === ''))
     visible.forEach((item, n) => {
       const before = visible[n - 1]
       const after = visible[n + 1]
+      if (item.isFraction && isFlat(item.box) && ((after && ['ord', 'open'].includes(after.kind)) || (before && ['ord', 'close'].includes(before.kind)))) {
+        item = { ...item, box: textBox(`(${flatText(item.box)})`) }
+      }
       let kind = item.kind
       // An operator with nothing to its left is a sign: -x, +1.
       if (kind === 'bin' && (!before || ['bin', 'rel', 'open', 'punct', 'op'].includes(before.kind))) kind = 'ord'
@@ -564,16 +651,22 @@ class Converter {
       // Relations take a space each side, binary operators one each side
       // between two operands, and a named or large operator one before an
       // operand next to it and one after, unless a bracket follows.
-      const spaceBefore = spaced && before && (kind === 'bin' || kind === 'rel' || (kind === 'op' && ['ord', 'close'].includes(before.kind)))
+      // Two relations side by side, as in :=, take no space between them.
+      const spaceBefore =
+        spaced && before && ((kind === 'bin' || kind === 'rel') && before.kind !== 'rel' ? true : kind === 'op' && ['ord', 'close'].includes(before.kind))
       const spaceAfter =
         spaced &&
         after &&
         after.kind !== 'close' &&
-        (kind === 'bin' || kind === 'rel' || kind === 'punct' || (kind === 'op' && !['punct', 'bin', 'rel'].includes(after.kind) && (after.kind !== 'open' || item.hasScripts)))
-      if (spaceBefore && !item.box.lines[item.box.base]?.startsWith(' ')) parts.push(textBox(' '))
+        (kind === 'bin' || (kind === 'rel' && after.kind !== 'rel') || kind === 'punct' || (kind === 'op' && !['punct', 'bin', 'rel'].includes(after.kind) && (after.kind !== 'open' || item.hasScripts)))
+      // A stacked operator is centered over its bounds, so its own row may
+      // already be blank at the edge.
+      if (spaceBefore && !baseBlank(item.box, 'left')) space()
+      // Boxes of several rows side by side, two fractions or two sums, keep
+      // a column between them, or their rules and bounds run together.
+      if (before && !isFlat(item.box) && !isFlat(before.box) && !blankEdge(before.box, 'right') && !blankEdge(item.box, 'left')) space()
       parts.push(item.box)
-      // A stacked operator's centered row may already start or end in a space.
-      if (spaceAfter && !item.box.lines[item.box.base]?.endsWith(' ')) parts.push(textBox(' '))
+      if (spaceAfter && !baseBlank(item.box, 'right')) space()
     })
     const box = hcat(parts)
     // Collapse the runs of spaces that spacing commands and padding leave.
@@ -599,7 +692,10 @@ class Converter {
       }
       if (c === '^' || c === '_') {
         this.i += 1
-        const raw = this.rawArg()
+        let raw = this.rawArg()
+        const command = /^\\([a-zA-Z]+)$/.exec(raw)?.[1]
+        const takes = command ? (ARITY[command] ?? this.macros.get(command)?.args ?? 0) : 0
+        for (let k = 0; k < takes; k++) raw += `{${this.rawArg()}}`
         if (c === '^') sup = sup === null ? raw : `${sup}${raw}`
         else sub = sub === null ? raw : `${sub}${raw}`
         continue
@@ -631,6 +727,7 @@ class Converter {
   }
 
   private atom(): Item | null {
+    if (this.i >= this.src.length) return null
     const c = this.src[this.i]!
     if (/\s/.test(c)) {
       this.i += 1
@@ -638,7 +735,10 @@ class Converter {
     }
     if (c === '{') {
       this.i += 1
-      return { box: this.sequence('}'), kind: 'ord' }
+      if (++this.groups > MAX_DEPTH) throw new Error('nested too deep')
+      const box = this.sequence('}')
+      this.groups -= 1
+      return { box, kind: 'ord' }
     }
     if (c === '}') {
       this.i += 1
@@ -762,14 +862,14 @@ class Converter {
         const hasVar = this.src[this.i] === '{'
         const x = hasVar ? this.rawArg() : null
         const power = order ? `^{${order}}` : ''
-        if (x === null) return this.fraction(`${d}${power}`, `${d}`, false)
+        // With one argument it is the variable: \dv{x} is d/dx.
+        if (x === null) return this.fraction(`${d}${power}`, `${d} ${f}${power}`, false)
         return this.fraction(`${d}${power} ${f}`, `${d} ${x}${power}`, false)
       }
       case 'binom': case 'dbinom': case 'tbinom': {
-        const n = this.rawArg()
-        const k = this.rawArg()
-        if (this.flat) return ord(`C(${flatText(this.sub(n, 'inline'))}, ${flatText(this.sub(k, 'inline'))})`)
-        return { box: delimited('(', vstack([this.sub(n, 'display'), this.sub(k, 'display')], 0), ')'), kind: 'ord' }
+        const mode: Mode = this.flat ? 'inline' : 'display'
+        const n = this.sub(this.rawArg(), mode)
+        return { box: this.binomialOf(n, this.sub(this.rawArg(), mode), ['(', ')']), kind: 'ord' }
       }
       case 'sqrt': {
         const index = this.optionalArg()
@@ -779,7 +879,7 @@ class Converter {
         const text = flatText(box)
         return ord(isSimple(text) ? `${sign}${text}` : `${sign}(${text})`)
       }
-      case 'operatorname': case 'operatorname*': case 'DeclareMathOperator': {
+      case 'operatorname': case 'operatorname*': {
         const text = this.rawArg().replace(/\\,|\\[:;!]/g, ' ').replace(/[{}\\]/g, '')
         return { box: textBox(text), kind: 'op', limits: name === 'operatorname*' }
       }
@@ -796,7 +896,7 @@ class Converter {
         const next = this.atom()
         if (!next) return null
         const text = flatText(next.box)
-        return { box: textBox(NEGATED[text] ?? `${text}̸`), kind: 'rel' }
+        return { box: textBox(NEGATED[text] ?? `${text}\u0338`), kind: 'rel' }
       }
       case 'mod': case 'bmod': return { box: textBox(' mod '), kind: 'space' }
       case 'pmod': return ord(` (mod ${flatText(this.arg('inline'))})`)
@@ -807,16 +907,20 @@ class Converter {
         const baseItem = this.sub(base, this.mode)
         const markBox = this.sub(mark, 'script')
         const isOver = name !== 'underset'
+        // Over a relation it is a relation, as amsmath makes it: a ≝ b.
+        const kind: Kind = name === 'stackrel' || RELATION_GLYPHS.has(flatText(baseItem).trim()) ? 'rel' : 'ord'
         if (this.flat) {
           const scripted = toScript(flatText(markBox), isOver ? SUP : SUB)
-          return { box: textBox(flatText(baseItem) + (scripted ?? `${isOver ? '^' : '_'}${wrapScript(flatText(markBox))}`)), kind: name === 'stackrel' ? 'rel' : 'ord' }
+          return { box: textBox(flatText(baseItem) + (scripted ?? `${isOver ? '^' : '_'}${wrapScript(flatText(markBox))}`)), kind }
         }
         const rows = isOver ? [markBox, baseItem] : [baseItem, markBox]
-        return { box: vstack(rows, isOver ? markBox.lines.length + baseItem.base : baseItem.base), kind: name === 'stackrel' ? 'rel' : 'ord' }
+        return { box: vstack(rows, isOver ? markBox.lines.length + baseItem.base : baseItem.base), kind }
       }
       case 'overbrace': case 'underbrace': case 'overbracket': case 'underbracket': {
         const box = this.arg()
-        if (this.flat) return { box, kind: 'ord' }
+        // On one line the brace is gone, so brackets keep a script that
+        // follows on the whole: (a + b)ₙ, not a + bₙ.
+        if (this.flat) return ord(wrapFlat(flatText(box)))
         const width = boxWidth(box)
         const brace = name.startsWith('over') ? '⏞' : '⏟'
         const rule = textBox(brace.repeat(Math.max(1, width)))
@@ -852,7 +956,7 @@ class Converter {
         this.rawArg()
         return null
       }
-      case 'newcommand': case 'renewcommand': case 'newcommand*': case 'renewcommand*': case 'providecommand': case 'def': case 'DeclareMathOperator*': {
+      case 'newcommand': case 'renewcommand': case 'newcommand*': case 'renewcommand*': case 'providecommand': case 'def': case 'DeclareMathOperator': case 'DeclareMathOperator*': {
         // A definition inside the formula: read it, then draw nothing.
         const start = this.i - name.length - 1
         const rest = this.src.slice(start)
@@ -891,7 +995,7 @@ class Converter {
       case 'curl': return ord('∇×')
       case 'divergence': return ord('∇⋅')
       case 'laplacian': return ord('∇²')
-      case 'vu': return ord(`${flatText(this.arg('inline'))}̂`)
+      case 'vu': return ord(`${flatText(this.arg('inline'))}\u0302`)
       case 'unit': case 'si': case 'SI': {
         if (name === 'SI') return ord(`${flatText(this.arg('inline'))} ${units(this.rawArg())}`)
         return ord(units(this.rawArg()))
@@ -911,7 +1015,8 @@ class Converter {
     }
     // A command with no Unicode form is left as its source, so nothing is
     // silently lost.
-    return ord(`\\${name}`)
+    // A letter after it stays apart: `\\foo y`, not `\\fooy`.
+    return ord(/^\s*[a-zA-Z]/.test(this.src.slice(this.i)) ? `\\${name} ` : `\\${name}`)
   }
 
   // A delimiter after \left, \right, \big and the like.
@@ -950,7 +1055,7 @@ class Converter {
     const c = this.src[this.i]
     if (takesOwn && c && '([|'.includes(c)) {
       const closing = c === '(' ? ')' : c === '[' ? ']' : '|'
-      const end = this.src.indexOf(closing, this.i + 1)
+      const end = matchingClose(this.src, this.i, c, closing)
       if (end > 0) {
         const inner = this.sub(this.src.slice(this.i + 1, end), this.mode)
         this.i = end + 1
@@ -961,17 +1066,29 @@ class Converter {
   }
 
   private fraction(top: string, bottom: string, forceFlat: boolean): Item {
-    if (this.flat || forceFlat) {
-      const a = flatText(this.sub(top, 'inline'))
-      const b = flatText(this.sub(bottom, 'inline'))
+    const flat = this.flat || forceFlat
+    const mode: Mode = flat ? 'inline' : 'display'
+    return this.fractionOf(this.sub(top, mode), this.sub(bottom, mode), flat)
+  }
+
+  // On one line a/b, with brackets around a side of several terms, or ½ for
+  // the common ones; stacked over a rule in a display.
+  private fractionOf(num: Box, den: Box, flat = this.flat): Item {
+    if (flat) {
+      const a = flatText(num)
+      const b = flatText(den)
       const vulgar = VULGAR[`${a}/${b}`]
       if (vulgar) return { box: textBox(vulgar), kind: 'ord' }
-      return { box: textBox(`${wrapFlat(a)}/${wrapFlat(b)}`), kind: 'ord' }
+      return { box: textBox(`${wrapFlat(a)}/${wrapFlat(b)}`), kind: 'ord', isFraction: true }
     }
-    const num = this.sub(top, 'display')
-    const den = this.sub(bottom, 'display')
     const width = Math.max(boxWidth(num), boxWidth(den)) + 2
     return { box: vstack([num, textBox('─'.repeat(width)), den], num.lines.length, width), kind: 'ord' }
+  }
+
+  // n over k in brackets, as \binom and \choose draw it; C(n, k) on one line.
+  private binomialOf(top: Box, bottom: Box, [open, close]: [string, string]): Box {
+    if (this.flat) return textBox(open === '(' ? `C(${flatText(top)}, ${flatText(bottom)})` : `${open}${flatText(top)}; ${flatText(bottom)}${close}`)
+    return delimited(open, vstack([top, bottom], 0), close)
   }
 
   // \text{...}: the words as written, with any $...$ inside converted.
@@ -1079,6 +1196,23 @@ class Converter {
   }
 }
 
+// Where the bracket opened at `start` closes, counting nested pairs and
+// skipping braces; -1 when it never does.
+function matchingClose(src: string, start: number, open: string, close: string): number {
+  let depth = 0
+  let braces = 0
+  for (let j = start; j < src.length; j++) {
+    const c = src[j]
+    if (c === '\\') j += 1
+    else if (c === '{') braces += 1
+    else if (c === '}') braces -= 1
+    else if (braces === 0 && c === close && (open === close ? j > start : depth === 1)) return j
+    else if (braces === 0 && c === open && open !== close) depth += 1
+    else if (braces === 0 && c === close) depth -= 1
+  }
+  return -1
+}
+
 function definitionLength(src: string): number {
   // The command, its name, an optional [n] or #1#2, and its body.
   const head = /^\\[a-zA-Z]+\*?\s*(\{\\[a-zA-Z]+\}|\\[a-zA-Z]+)\s*(\[\d\]|(#\d)+)?\s*/.exec(src)
@@ -1095,7 +1229,7 @@ const VULGAR: Record<string, string> = {
 
 // A text that reads as one term: a number, or a name with its scripts.
 function isSimple(text: string): boolean {
-  return [...text].length <= 1 || /^[\p{L}\p{N}.′\p{M}⁰-₟ᵃ-ᶿ∂∇]+$/u.test(text)
+  return [...text].length <= 1 || /^[\p{L}\p{N}.′\p{M}⁰-₟ᵃ-ᶿ∂∇]+(\([^()\s]*\))?$/u.test(text)
 }
 const wrapFlat = (text: string) => (isSimple(text) || /^\(.*\)$/.test(text) ? text : `(${text})`)
 const wrapScript = (text: string) => ([...text].length === 1 ? text : `(${text})`)
@@ -1146,11 +1280,20 @@ function units(src: string): string {
   return out
 }
 
+// The formula with its macros expanded, the ones it defines itself too: a
+// definition lasts to the end of its formula, as in MathJax.
+function prepare(tex: string, macros: Macros): { src: string; local: Macros } {
+  if (tex.length > MAX_FORMULA_CHARS) throw new Error('formula too long')
+  const local = readMacros(tex, new Map(macros))
+  const defines = /\\(?:(?:re)?newcommand|providecommand|DeclareMathOperator|def)(?![a-zA-Z])/.test(tex)
+  return { src: expandMacros(defines ? stripDefinitions(tex) : tex, local), local }
+}
+
 // One line of Unicode for an inline formula.
 export function texToUnicode(tex: string, macros: Macros = new Map()): string {
   try {
-    const local = new Map(macros)
-    return flatText(new Converter(expandMacros(tex, local), 'inline', local).run()).replace(/\s+/g, ' ').trim()
+    const { src, local } = prepare(tex, macros)
+    return flatText(new Converter(src, 'inline', local).run()).replace(/\s+/g, ' ').trim()
   } catch {
     return tex
   }
@@ -1159,8 +1302,9 @@ export function texToUnicode(tex: string, macros: Macros = new Map()): string {
 // The rows of a display formula, laid out in two dimensions.
 export function texToUnicodeLines(tex: string, macros: Macros = new Map()): string[] {
   try {
-    const local = new Map(macros)
-    let src = expandMacros(tex, local).trim()
+    const prepared = prepare(tex, macros)
+    const local = prepared.local
+    let src = prepared.src.trim()
     // A bare row break or & at the top level makes the whole formula an
     // aligned block.
     if (!/^\\begin\{/.test(src) && splitRows(src).some(row => row.length > 1)) src = `\\begin{aligned}${src}\\end{aligned}`

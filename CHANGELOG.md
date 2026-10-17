@@ -7,6 +7,10 @@
 - In a terminal the model is told that math shows as Unicode there and that LaTeX blocks are not compiled.
 - Your messages in a terminal follow the **Your messages** setting: `under` shows their math below the row, `rendered` draws the whole message.
 - The settings pane test answers `config.set` with a plain value, as the engine now requires.
+- A dollar inside a code span no longer closes a formula: `$5 and $10, and \`$HOME\`` was drawn as math, on the desktop too.
+- The Unicode conversion is bounded: a macro that calls itself stops after 1000 expansions, groups nest at most 60 deep, and a formula over 20,000 characters is shown as written, so no formula can stall a render or a key press.
+- Macros a formula defines itself apply within it, `\over`, `\choose` and `\atop` work, a one-line fraction gets brackets beside other terms (`(a/b)c`), and side-by-side stacked fractions and sums keep a gap.
+- In a terminal, links keep their address, and a display formula wider than the window is drawn on one line instead of wrapping row by row.
 
 ## 0.5.0
 

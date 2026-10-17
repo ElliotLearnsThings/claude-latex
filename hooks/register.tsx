@@ -247,8 +247,10 @@ async function setupSandbox($: Engine, home: string): Promise<void> {
   else $.ui.log('latex: could not sandbox LaTeX here, so LaTeX blocks run without a sandbox', { to: 'debug' })
 }
 let macros = ''
-// The macros file's definitions, read for the Unicode conversion.
+// The macros file's definitions, read for the Unicode conversion, and
+// whether the file has been read yet.
 let unicodeMacros = readMacros('')
+let macrosRead = false
 // The colors the terminal and the prompt box use, picked at session start
 // when the setting follows the system.
 let terminalStyle = DARK_STYLE
@@ -441,6 +443,19 @@ export const register: Register = (on, options) => {
       debug($, `session start, options ${JSON.stringify(options)}`)
       if (scheme === 'auto') terminalStyle = isLightTerminal(await $.env.get('COLORFGBG').catch(() => undefined)) ? LIGHT_STYLE : DARK_STYLE
 
+      // The macros come first: every formula, in every surface, reads them.
+      await step($, 'macros', async () => {
+        const macrosPath = String(options.macrosFile || '~/.claude/latex-macros.tex').replace(/^~(?=\/)/, home)
+        if (await $.fs.exists(macrosPath)) {
+          macros = await $.fs.read(macrosPath)
+          unicodeMacros = readMacros(macros)
+          const error = definePreamble(macros)
+          if (error) $.ui.log(`latex: ${macrosPath}: ${error}`)
+        }
+      })
+      macrosRead = true
+      if (macros) await update($, version, n => n + 1).catch(() => undefined)
+
       if (blocksOn || latexFont) {
         let ready = false
         await step($, 'find TeX', async () => {
@@ -472,15 +487,6 @@ export const register: Register = (on, options) => {
         }
       }
 
-      await step($, 'macros', async () => {
-        const macrosPath = String(options.macrosFile || '~/.claude/latex-macros.tex').replace(/^~(?=\/)/, home)
-        if (await $.fs.exists(macrosPath)) {
-          macros = await $.fs.read(macrosPath)
-          unicodeMacros = readMacros(macros)
-          const error = definePreamble(macros)
-          if (error) $.ui.log(`latex: ${macrosPath}: ${error}`)
-        }
-      })
       await step($, 'settings rows', async () => {
         const keys = (await $.config.list()).map(row => row.key).filter(key => key.startsWith('latex'))
         debug($, `     keys ${JSON.stringify(keys)}`)
@@ -550,12 +556,16 @@ export const register: Register = (on, options) => {
       let pieces = parse(text, { blocks: false })
       if (mode === 'under') pieces = mathOnly(pieces)
       if (!pieces.some(p => p.kind !== 'md') && !isMarkdownToo) return next(e)
-      const { Box, Text, Markdown } = $.ui.resolve(e)
+      // Drawn before the macros file is read, a message is drawn again
+      // once it is.
+      if (!macrosRead) await read($, version)
+      const { Box, Text, Markdown, Link } = $.ui.resolve(e)
       const tree = drawTerminal(pieces, {
-        el: { Box, Text, Markdown },
+        el: { Box, Text, Markdown, Link },
         style: terminalStyle,
         inline: tex => texToUnicode(tex, unicodeMacros),
         display: tex => texToUnicodeLines(tex, unicodeMacros),
+        columns: e.viewport?.columns ?? 80,
       })
       debug($, `drew ${e.component} ${e.props.text.length} chars in the terminal as ${mode}: pieces ${pieces.map(p => p.kind[0]).join('')}, ${Date.now() - renderStarted} ms`)
       // `under` keeps the app's row and adds the math below it. `rendered`
