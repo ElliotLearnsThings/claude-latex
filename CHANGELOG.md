@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- A setup check, at the top of `/latex` and as text with `/latex setup`. It says which TeX the mod uses and where it is, which LaTeX packages the mod's documents load are missing (a minimal TeX Live lacks `standalone.cls`, and every block then failed), whether the sandbox is on, and how many macros were read, and gives the one command that installs what is missing. **Check again** re-runs it after an install, with no restart.
+- The check configures the mod by itself: a LaTeX math font whose package is not installed falls back to MathJax with a note instead of failing every formula, and the welcome band says when diagrams cannot compile yet.
+- A **Backend** setting: `auto`, `latex`, `xelatex` or `mathjax`. XeLaTeX lets blocks load system OpenType fonts with `fontspec`, with saved formats of its own. `mathjax` never runs a local TeX. A **TeX folder** setting points the mod at one folder instead of searching.
+- LaTeX on Linux runs in a bubblewrap sandbox: an empty home folder with only the mod's cache and TeX's own trees bound back, a read-only root, a private `/tmp`, no network. The same attacks as on macOS were tried and blocked.
+- Macros from the settings: the **Macros file** path can be edited in `/latex`, **Create it with examples** writes a starter file, and **Reload macros** or `/latex reload` reads it again with no restart. Every formula, in every surface, reads the macros, and the terminal and prompt box use them too.
+- The settings pane is grouped (Setup, Rendering, Macros, Terminal, Messages) and opens tall enough in a terminal to show every setting.
+
 ## 0.6.0
 
 - Math renders in a terminal. Each formula becomes Unicode text in the math color: inline math in the line (`\alpha^2 + \frac{1}{2}` reads `α² + ½`), display math laid out over several rows, with stacked fractions, sums with their bounds above and below, matrices and cases in tall brackets and `align` rows lined up. Math alphabets (`\mathbb`, `\mathcal`, `\mathfrak`, `\bm`), accents, `\ce` and the macros file all apply. LaTeX blocks stay code. The **Math in the terminal** setting turns it off.

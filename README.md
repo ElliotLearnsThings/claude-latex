@@ -33,7 +33,7 @@ Requirements:
 
 - **Claude Code 2.1.287 or later** (mods were introduced here).
 - **The Code tab of the Claude desktop app** for typeset math and diagrams, or **`claude` in a terminal** for math as Unicode text (see [In the terminal](#in-the-terminal)). The VS Code extension is not supported. See [Where it works](#where-it-works). The chat section of the Claude desktop app already supports LaTeX rendering.
-- **Optional: a TeX install** with `latex` and `dvisvgm`, such as [MacTeX](https://www.tug.org/mactex/) or TeX Live. You need it for diagrams, LaTeX blocks and the extra fonts. Math works without it.
+- **Optional: a TeX install** with `latex` (or `xelatex`) and `dvisvgm`, such as [MacTeX](https://www.tug.org/mactex/) or TeX Live. You need it for diagrams, LaTeX blocks and the extra fonts. Math works without it. Run `/latex setup` to see what the mod found and what, if anything, is missing.
 
 ## Rendering Capabilities
 
@@ -107,15 +107,33 @@ Run `/latex` to open the settings pane. Each change applies at once.
 
 | Setting | Default | Usage |
 | --- | --- | --- |
+| Backend | `auto` | What typesets LaTeX blocks and the LaTeX fonts: `latex`, `xelatex`, or `mathjax` (never runs your TeX). `auto` takes the first installed of `latex` and `xelatex` |
+| TeX folder | empty | The folder holding `latex` (or `xelatex`) and `dvisvgm`. Empty searches the usual places and your `PATH` |
 | Math font | `mathjax` | MathJax, or one of 10 LaTeX fonts typeset by your TeX install |
 | Math color | `auto` | `auto` follows your system's light or dark setting. Pick `light` or `dark` if the app's theme differs |
 | Compile LaTeX blocks | on | Compile ` ```tikz `, ` ```tikzcd ` and ` ```latex ` blocks |
-| Math under your messages | on | Show the math and diagrams from your messages under the bubble |
-| Full rendered copy of your messages | off | Show your whole message rendered under the bubble |
+| Your messages | `off` | `off` leaves them as typed, `under` shows their math below them, `rendered` (experimental) draws them as Markdown with math |
+| Tell the model how math renders here | on | One short section in the system prompt with the syntax that renders and the limits |
 | Copy TeX button | off | A button under each display formula and block that copies its source |
 | Math in the terminal | on | Show math in replies as Unicode text when Claude Code runs in a terminal |
 | Style the prompt box | on | Color the Markdown you type, render-markdown.nvim style, and preview each formula as Unicode |
 | Macros file | `~/.claude/latex-macros.tex` | Your own `\newcommand` and `\DeclareMathOperator` lines |
+
+### Setup check
+
+The top of `/latex` says what the mod found: the backend and where it lives, any LaTeX packages the mod's documents load that your install lacks, whether the sandbox is on, and your macros file. When something is missing it gives the one command that installs it, for example `sudo tlmgr install standalone mhchem` or `sudo apt install texlive-latex-extra`. Install it, then press **Check again**: no restart needed. `/latex setup` prints the same report as text.
+
+The check also configures itself. A LaTeX math font whose package is not installed falls back to MathJax with a note, instead of failing every formula, and the welcome band says when diagrams cannot compile yet.
+
+### Backends
+
+| Backend | Use it for |
+| --- | --- |
+| `latex` | The default where installed. pdfTeX writing DVI, with saved formats: the fastest |
+| `xelatex` | Blocks that load system OpenType fonts with `fontspec`, or need scripts beyond Latin. Slower |
+| `mathjax` | Never running a local TeX. Formulas use MathJax and blocks stay code |
+
+Tectonic is not offered: it typesets, but `dvisvgm` finds font files only through a TeX Live tree, so on a machine with only Tectonic every formula came out blank.
 
 ### Macros
 
@@ -127,7 +145,9 @@ Put definitions in `~/.claude/latex-macros.tex`:
 \DeclareMathOperator*{\argmin}{arg\,min}
 ```
 
-This here would mean `$\E[X]$` and `$\argmin_\theta L(\theta)$` then work in every message, in MathJax and in LaTeX.
+This here would mean `$\E[X]$` and `$\argmin_\theta L(\theta)$` then work in every message, in MathJax, in LaTeX and in the terminal's Unicode.
+
+No file yet? **Create it with examples** in `/latex` writes one with the number sets, `\E`, `\Var`, `\argmin` and `\norm`. You can point the **Macros file** setting anywhere. After editing it, press **Reload macros** or run `/latex reload`: no restart needed.
 
 ### LaTeX blocks
 
@@ -151,7 +171,7 @@ Diagrams can be a little slow i.e 0.4 to 0.7 seconds to compile the first time a
 Claude writes the LaTeX blocks, so a reply could try to make LaTeX read or write your files. The mod treats every block as untrusted:
 
 - Shell escape is off (`-no-shell-escape`).
-- Every `latex` and `dvisvgm` run goes through macOS's `sandbox-exec`. The sandbox blocks reading your home folder apart from TeX's own folders and the mod's cache, blocks writing anywhere else, and blocks the network.
+- Every `latex` and `dvisvgm` run goes through a sandbox: `sandbox-exec` on macOS, [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) on Linux. The sandbox blocks reading your home folder apart from TeX's own folders and the mod's cache, blocks writing anywhere else, and blocks the network. `/latex setup` says which one is on.
 - TeX's own `openout_any=p` blocks writing outside the build folder.
 - A compile is stopped after 60 seconds.
 - A drawing over the app's 128 KB limit shows an error on that block instead of breaking the message.
@@ -170,7 +190,8 @@ Details and how to report a problem are in [SECURITY.md](SECURITY.md).
 
 ## Troubleshooting
 
-- **LaTeX blocks stay as code.** The mod did not find `latex` and `dvisvgm`. It looks in `/Library/TeX/texbin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` and your `PATH`.
+- **LaTeX blocks stay as code.** The mod did not find `latex` and `dvisvgm`. It looks in `/Library/TeX/texbin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` and your `PATH`, or only in **TeX folder** when you set it. Run `/latex setup`.
+- **Every block fails with `standalone.cls not found`** (or another file). Your TeX install is a minimal one. `/latex setup` lists what is missing and the command that installs it.
 - **Something else looks wrong.** Each session writes a setup log to `~/.cache/claude-latex/debug/setup.log`, with every setup step, how long it took, and any drawing error. Attach it to a bug report.
 
 ## How it works

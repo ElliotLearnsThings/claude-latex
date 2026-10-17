@@ -1,8 +1,8 @@
 {
   "name": "latex",
   "displayName": "LaTeX",
-  "version": "0.6.0",
-  "description": "Render TeX math, TikZ diagrams and LaTeX blocks in Claude Code's desktop app, in any of 10 LaTeX fonts, with every LaTeX compile sandboxed. In the terminal, math shows as Unicode and the prompt box previews it as you type",
+  "version": "0.7.0",
+  "description": "Render TeX math, TikZ diagrams and LaTeX blocks in Claude Code's desktop app, in any of 10 LaTeX fonts, with every LaTeX compile sandboxed on macOS and Linux. In the terminal, math shows as Unicode and the prompt box previews it as you type",
   "author": {
     "name": "Zaahir Ali"
   },
@@ -27,6 +27,18 @@
       "title": "Math color",
       "description": "auto, light or dark. auto follows the system light or dark setting. Pick light or dark if the app's theme differs from the system's.",
       "default": "auto"
+    },
+    "backend": {
+      "type": "string",
+      "title": "Backend",
+      "description": "What typesets LaTeX blocks and the LaTeX fonts: auto, latex, xelatex or mathjax. auto takes the first installed of latex and xelatex. xelatex lets blocks load system fonts with fontspec. mathjax never runs a local TeX. Easiest to pick in /latex.",
+      "default": "auto"
+    },
+    "texPath": {
+      "type": "string",
+      "title": "TeX folder",
+      "description": "The folder holding latex (or xelatex) and dvisvgm. Leave empty to search /Library/TeX/texbin, /opt/homebrew/bin, /usr/local/bin, /usr/bin and your PATH.",
+      "default": ""
     },
     "tikz": {
       "type": "boolean",

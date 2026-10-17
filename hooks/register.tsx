@@ -7,8 +7,22 @@ import { promptDecorations } from './prompt'
 import { DARK_STYLE, isLightTerminal, LIGHT_STYLE } from './style'
 import { drawTerminal } from './terminal'
 import { readMacros, texToUnicode, texToUnicodeLines } from './unicode'
+import { countDefinitions, MACROS_TEMPLATE } from './macros'
+import { BWRAP_CANDIDATES, macProfile, SANDBOX_EXEC, sandboxed, type Sandbox } from './sandbox'
 import {
-  BIN_CANDIDATES,
+  BACKENDS,
+  describeSetup,
+  FONT_FILES,
+  findToolchain,
+  isBackend,
+  missingFiles,
+  platformOf,
+  searchFolders,
+  type Backend,
+  type SetupReport,
+  type Toolchain,
+} from './setup'
+import {
   documentForBlock,
   documentForMath,
   fullDocument,
@@ -52,6 +66,10 @@ const version = atom({ plugin: 'latex', key: 'version' } as const, 0)
 // The one-time welcome band. Shown until dismissed, then remembered in the
 // store across sessions.
 const intro = atom({ plugin: 'latex', key: 'intro' } as const, false)
+// Goes up each time the setup check or the macros change, which redraws the
+// settings pane.
+const setup = atom({ plugin: 'latex', key: 'setup' } as const, 0)
+const DEFAULT_MACROS_FILE = '~/.claude/latex-macros.tex'
 const INTRO_SEEN = 'introSeen'
 const PANE = 'latex-settings'
 
@@ -122,8 +140,12 @@ const MAX_SVG_CHARS = 131072 - 400
 // the app's own Markdown.
 const MAX_MESSAGE_CHARS = 235_000
 
-// Where latex and dvisvgm live, and where compiled SVGs are kept.
-let tex: { bin: string; cacheDir: string } | null = null
+// The TeX that typesets (latex or xelatex, and dvisvgm), and where compiled
+// SVGs are kept. Null while there is none: math then uses MathJax and blocks
+// stay code.
+let tex: { toolchain: Toolchain; cacheDir: string } | null = null
+// What the last setup check found, for the settings pane and /latex setup.
+let setupReport: SetupReport | null = null
 // A log the mod writes to ~/.cache/claude-latex/debug/, readable without
 // the app: each setup step, its time, and why it failed.
 const debugLines: string[] = []
@@ -209,42 +231,38 @@ function startWorkers($: Engine, latexFont: LatexFont | null): void {
   })
 }
 
-// A macOS sandbox profile every TeX run goes through, when sandbox-exec works
-// here. A LaTeX block can \\input any file by its absolute path, and TeX's own
-// openin_any setting does not stop that, so the profile denies reading the
-// home folder apart from TeX's and the mod's own folders, and denies the
-// network and writes outside them.
-let sandbox: string | null = null
-const SANDBOX_EXEC = '/usr/bin/sandbox-exec'
+// The sandbox every TeX run goes through (hooks/sandbox.ts): sandbox-exec
+// on macOS, bubblewrap on Linux, when either starts here.
+let sandbox: Sandbox | null = null
+let sandboxNote = 'off'
 // TeX's own write guard: no writing outside the build folder.
 const TEX_ENV = { openout_any: 'p', openin_any: 'p' }
 
-function sandboxProfile(home: string, cacheDir: string): string {
-  const q = (path: string) => JSON.stringify(path)
-  return [
-    '(version 1)',
-    '(allow default)',
-    '(deny network*)',
-    `(deny file-read* (subpath ${q(home)}) (subpath "/Volumes"))`,
-    `(allow file-read* (subpath ${q(cacheDir)}) (subpath ${q(`${home}/Library/texlive`)}) (subpath ${q(`${home}/Library/texmf`)}) (subpath ${q(`${home}/texmf`)}))`,
-    '(deny file-write* (subpath "/"))',
-    `(allow file-write* (subpath ${q(cacheDir)}) (subpath ${q(`${home}/Library/texlive`)}) (subpath "/private/tmp") (subpath "/private/var/folders") (literal "/dev/null"))`,
-    '',
-  ].join('\n')
-}
-
-// Wraps a TeX command in the sandbox when there is one.
 function texArgv(argv: string[]): string[] {
-  return sandbox ? [SANDBOX_EXEC, '-f', sandbox, ...argv] : argv
+  return sandboxed(sandbox, argv)
 }
 
+// Tries each sandbox this machine may have, keeping the first whose probe
+// runs.
 async function setupSandbox($: Engine, home: string): Promise<void> {
   if (!tex || !home) return
-  const path = `${tex.cacheDir}/sandbox.sb`
-  await $.fs.write(path, sandboxProfile(home, tex.cacheDir))
-  const probe = await $.process.run([SANDBOX_EXEC, '-f', path, '/usr/bin/true']).catch(() => null)
-  if (probe?.exitCode === 0) sandbox = path
-  else $.ui.log('latex: could not sandbox LaTeX here, so LaTeX blocks run without a sandbox', { to: 'debug' })
+  const { cacheDir } = tex
+  const profile = `${cacheDir}/sandbox.sb`
+  await $.fs.write(profile, macProfile(home, cacheDir))
+  const candidates: Sandbox[] = [{ kind: 'macos', profile }]
+  for (const bwrap of BWRAP_CANDIDATES) {
+    if (await $.fs.exists(bwrap).catch(() => false)) candidates.push({ kind: 'bwrap', bwrap, home, cacheDir })
+  }
+  for (const candidate of candidates) {
+    const probe = await $.process.run(sandboxed(candidate, ['/usr/bin/true']), { cwd: cacheDir, timeoutMs: 10000 }).catch(() => null)
+    if (probe?.exitCode === 0) {
+      sandbox = candidate
+      sandboxNote = candidate.kind === 'macos' ? 'on (macOS sandbox-exec)' : `on (bubblewrap, ${candidate.bwrap})`
+      return
+    }
+  }
+  sandboxNote = 'off: neither sandbox-exec nor bubblewrap (bwrap) runs here, so LaTeX blocks run without a sandbox'
+  $.ui.log('latex: could not sandbox LaTeX here, so LaTeX blocks run without a sandbox', { to: 'debug' })
 }
 let macros = ''
 // The macros file's definitions, read for the Unicode conversion, and
@@ -255,17 +273,10 @@ let macrosRead = false
 // when the setting follows the system.
 let terminalStyle = DARK_STYLE
 
-async function findTex($: Engine, home: string, path: string): Promise<boolean> {
-  for (const dir of [...BIN_CANDIDATES, ...path.split(':').filter(Boolean)]) {
-    const found =
-      (await $.fs.exists(`${dir}/latex`).catch(() => false)) &&
-      (await $.fs.exists(`${dir}/dvisvgm`).catch(() => false))
-    if (found) {
-      tex = { bin: dir, cacheDir: `${home}/.cache/claude-latex` }
-      return true
-    }
-  }
-  return false
+async function findTex($: Engine, home: string, backend: Backend, folders: string[]): Promise<boolean> {
+  const toolchain = await findToolchain($, backend, folders)
+  tex = toolchain ? { toolchain, cacheDir: `${home}/.cache/claude-latex` } : null
+  return tex !== null
 }
 
 // Saved LaTeX formats: the class and fixed preamble of one kind of document,
@@ -284,7 +295,8 @@ async function buildFormat($: Engine, name: string, base: string): Promise<strin
   // looks while another builds never reads half a format.
   const temp = `${name}-${Math.random().toString(36).slice(2, 8)}`
   await $.fs.write(`${dir}/${temp}.tex`, `${base}\n\\dump\n`)
-  await $.process.run(texArgv([`${tex!.bin}/latex`, '-ini', '-interaction=nonstopmode', `-jobname=${temp}`, '&latex', `${temp}.tex`]), {
+  const { engine, typesetter } = tex!.toolchain
+  await $.process.run(texArgv([typesetter, '-ini', '-interaction=nonstopmode', `-jobname=${temp}`, `&${engine}`, `${temp}.tex`]), {
     cwd: dir,
     env: TEX_ENV,
     timeoutMs: 120000,
@@ -296,7 +308,7 @@ async function buildFormat($: Engine, name: string, base: string): Promise<strin
 }
 
 function formatName(doc: TexDoc): string {
-  return `fmt-${doc.kind}-${hashOf(doc.base)}`
+  return `fmt-${tex!.toolchain.engine}-${doc.kind}-${hashOf(doc.base)}`
 }
 
 function formatFor($: Engine, doc: TexDoc): Promise<string | null> {
@@ -313,11 +325,13 @@ function formatFor($: Engine, doc: TexDoc): Promise<string | null> {
 // Runs latex then dvisvgm in a fresh folder `dir`, then removes it.
 // Returns the SVG pages in order, or the LaTeX error.
 async function runTex($: Engine, dir: string, doc: TexDoc, dvisvgmArgs: string[]): Promise<string[] | { error: string; interrupted?: boolean }> {
-  const { bin } = tex!
+  const { engine, typesetter, dvisvgm: dvisvgmPath } = tex!.toolchain
+  // XeTeX writes XDV, which dvisvgm reads as it reads DVI.
+  const output = engine === 'xelatex' ? 'd.xdv' : 'd.dvi'
   const latex = async (source: string, fmt: string | null) => {
     await $.fs.write(`${dir}/d.tex`, source)
     return $.process.run(
-      texArgv([`${bin}/latex`, ...(fmt ? [`-fmt=${fmt}`] : []), '-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', 'd.tex']),
+      texArgv([typesetter, ...(fmt ? [`-fmt=${fmt}`] : []), ...(engine === 'xelatex' ? ['-no-pdf'] : []), '-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', 'd.tex']),
       { cwd: dir, env: TEX_ENV, timeoutMs: 60000 },
     )
   }
@@ -335,7 +349,7 @@ async function runTex($: Engine, dir: string, doc: TexDoc, dvisvgmArgs: string[]
       const isTexError = run.stdout.includes('\n!') || run.stdout.startsWith('!')
       return isTexError ? { error: texError(run.stdout) } : { error: 'The compile was interrupted.', interrupted: true }
     }
-    const dvisvgm = await $.process.run(texArgv([`${bin}/dvisvgm`, '--no-fonts', '--precision=2', ...dvisvgmArgs, 'd.dvi']), {
+    const dvisvgm = await $.process.run(texArgv([dvisvgmPath, '--no-fonts', '--precision=2', ...dvisvgmArgs, output]), {
       cwd: dir,
       env: TEX_ENV,
       timeoutMs: 60000,
@@ -419,13 +433,118 @@ async function fromDisk($: Engine, file: string, key: string): Promise<Rendered 
   return { svg }
 }
 
+// What the settings say, for the setup functions below. Set by register.
+type Settings = { chosenFont: LatexFont | null; backend: Backend; texPath: string; macrosOption: string; blocksOn: boolean }
+let settings: Settings = { chosenFont: null, backend: 'auto', texPath: '', macrosOption: DEFAULT_MACROS_FILE, blocksOn: true }
+// The font formulas are typeset in: the chosen one, or none (MathJax) when
+// the setup check finds its package missing.
+let latexFont: LatexFont | null = null
+let home = ''
+let macrosInfo: SetupReport['macros'] = { path: DEFAULT_MACROS_FILE, count: 0, exists: false }
+
+function macrosPath(): string {
+  return settings.macrosOption.replace(/^~(?=\/)/, home)
+}
+
+// Reads the macros file into MathJax and the Unicode converter.
+async function loadMacros($: Engine): Promise<void> {
+  const path = macrosPath()
+  macrosInfo = { path, count: 0, exists: false }
+  if (!(await $.fs.exists(path).catch(() => false))) return
+  macros = await $.fs.read(path)
+  unicodeMacros = readMacros(macros)
+  const error = definePreamble(macros)
+  macrosInfo = { path, count: countDefinitions(macros), exists: true, ...(error ? { error } : {}) }
+  if (error) $.ui.log(`latex: ${path}: ${error}`)
+}
+
+// Finds TeX, checks its packages, and writes the setup report. A chosen
+// LaTeX font whose package is missing falls back to MathJax, with a note,
+// instead of failing every formula.
+async function checkSetup($: Engine): Promise<boolean> {
+  const { chosenFont, backend, texPath } = settings
+  const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
+  const folders = searchFolders(texPath, path, home)
+  const ready = await findTex($, home, backend, folders)
+  debug($, `     TeX ${ready ? `${tex!.toolchain.engine} at ${tex!.toolchain.bin}` : 'not found'}`)
+  const missing = ready ? await missingFiles($, tex!.toolchain, chosenFont) : []
+  latexFont = chosenFont
+  if (chosenFont && (!ready || missing.some(file => file === FONT_FILES[chosenFont]))) {
+    latexFont = null
+    $.ui.log(ready ? `latex: the ${chosenFont} font is not installed, so math uses MathJax. Run /latex setup for how to install it.` : 'latex: no latex and dvisvgm found, so math uses MathJax')
+  }
+  if (missing.length) debug($, `     missing ${missing.join(' ')}`)
+  setupReport = { backend, toolchain: tex?.toolchain ?? null, folders, missing, sandbox: sandboxNote, platform: await platformOf($), macros: macrosInfo }
+  return ready
+}
+
+async function bumpSetup($: Engine): Promise<void> {
+  if (setupReport) setupReport = { ...setupReport, sandbox: sandboxNote, macros: macrosInfo }
+  await update($, setup, n => n + 1).catch(() => undefined)
+}
+
+// Finds TeX and gets it ready: the sandbox, the saved formats, the workers.
+// Run at session start and again from the settings pane, after an install.
+// With blocks and fonts off it only writes the report.
+async function setUpTex($: Engine): Promise<void> {
+  if (settings.blocksOn || settings.chosenFont) {
+    let ready = false
+    await step($, 'find TeX', async () => {
+      ready = await checkSetup($)
+    })
+    if (ready) {
+      await step($, 'sandbox', async () => {
+        await setupSandbox($, home)
+        debug($, `     sandbox ${sandbox ? 'on' : 'off'}`)
+      })
+      // A compile killed mid-run (a reload, a crash) leaves its folder.
+      // Clear folders older than ten minutes, which no live compile uses.
+      void $.process
+        .run(['/usr/bin/find', `${tex!.cacheDir}/build`, '-mindepth', '1', '-maxdepth', '1', '-mmin', '+10', '-exec', '/bin/rm', '-rf', '{}', '+'])
+        .catch(() => undefined)
+      // Build the common formats now, in the background, so the first
+      // diagram does not wait for them.
+      const font = latexFont ?? 'cm'
+      void formatFor($, documentForBlock({ key: '', lang: 'tikz', source: '' }, font, ''))
+      void formatFor($, documentForBlock({ key: '', lang: 'latex', source: '' }, font, ''))
+      if (latexFont) void formatFor($, documentForMath([], latexFont, ''))
+      startWorkers($, latexFont)
+      // Messages drawn before TeX was found left their blocks as code.
+      // Draw them again now that blocks can compile.
+      await update($, version, n => n + 1).catch(() => undefined)
+    }
+  } else {
+    await step($, 'setup report', () => checkSetup($))
+  }
+  await bumpSetup($)
+}
+
+async function reloadMacros($: Engine): Promise<void> {
+  await loadMacros($)
+  await update($, version, n => n + 1).catch(() => undefined)
+  await bumpSetup($)
+}
+
+// Writes the macros template where the setting points, unless a file is
+// there already, and reads it.
+async function createMacros($: Engine): Promise<void> {
+  const path = macrosPath()
+  if (!(await $.fs.exists(path).catch(() => false))) await $.fs.write(path, MACROS_TEMPLATE)
+  await reloadMacros($)
+}
+
 export const register: Register = (on, options) => {
   const scheme = (['light', 'dark'].includes(String(options.colorScheme))
     ? options.colorScheme
     : 'auto') as ColorScheme
   const fontOption = String(options.mathFont ?? 'mathjax')
-  const latexFont: LatexFont | null = isLatexFont(fontOption) ? fontOption : null
+  const chosenFont: LatexFont | null = isLatexFont(fontOption) ? fontOption : null
+  latexFont = chosenFont
+  const backend: Backend = isBackend(options.backend) ? options.backend : 'auto'
+  const texPath = String(options.texPath ?? '')
+  const macrosOption = String(options.macrosFile || DEFAULT_MACROS_FILE)
   const blocksOn = options.tikz !== false
+  settings = { chosenFont, backend, texPath, macrosOption, blocksOn }
   const bubbleMode: BubbleMode = BUBBLE_MODES.find(mode => mode === options.userBubble) ?? 'off'
   const showCopy = options.copyButton === true
   const tellModel = options.tellModel !== false
@@ -438,60 +557,26 @@ export const register: Register = (on, options) => {
     // Setup runs after the session is ready, so it never holds it up. TeX
     // comes first: it is what most of the mod needs.
     void (async () => {
-      const home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
+      home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
       debugDir = home ? `${home}/.cache/claude-latex/debug` : ''
       debug($, `session start, options ${JSON.stringify(options)}`)
       if (scheme === 'auto') terminalStyle = isLightTerminal(await $.env.get('COLORFGBG').catch(() => undefined)) ? LIGHT_STYLE : DARK_STYLE
 
-      // The macros come first: every formula, in every surface, reads them.
-      await step($, 'macros', async () => {
-        const macrosPath = String(options.macrosFile || '~/.claude/latex-macros.tex').replace(/^~(?=\/)/, home)
-        if (await $.fs.exists(macrosPath)) {
-          macros = await $.fs.read(macrosPath)
-          unicodeMacros = readMacros(macros)
-          const error = definePreamble(macros)
-          if (error) $.ui.log(`latex: ${macrosPath}: ${error}`)
-        }
-      })
+      // The macros come first: every formula, in every surface, reads
+      // them, and the setup report counts them.
+      await step($, 'macros', () => loadMacros($))
       macrosRead = true
       if (macros) await update($, version, n => n + 1).catch(() => undefined)
 
-      if (blocksOn || latexFont) {
-        let ready = false
-        await step($, 'find TeX', async () => {
-          const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
-          ready = await findTex($, home, path)
-          debug($, `     TeX ${ready ? `at ${tex?.bin}` : 'not found'}`)
-        })
-        if (!ready && latexFont) $.ui.log('latex: no latex and dvisvgm found, so math uses MathJax')
-        if (ready) {
-          await step($, 'sandbox', async () => {
-            await setupSandbox($, home)
-            debug($, `     sandbox ${sandbox ? 'on' : 'off'}`)
-          })
-          // A compile killed mid-run (a reload, a crash) leaves its folder.
-          // Clear folders older than ten minutes, which no live compile uses.
-          void $.process
-            .run(['/usr/bin/find', `${tex!.cacheDir}/build`, '-mindepth', '1', '-maxdepth', '1', '-mmin', '+10', '-exec', '/bin/rm', '-rf', '{}', '+'])
-            .catch(() => undefined)
-          // Build the common formats now, in the background, so the first
-          // diagram does not wait for them.
-          const font = latexFont ?? 'cm'
-          void formatFor($, documentForBlock({ key: '', lang: 'tikz', source: '' }, font, ''))
-          void formatFor($, documentForBlock({ key: '', lang: 'latex', source: '' }, font, ''))
-          if (latexFont) void formatFor($, documentForMath([], latexFont, ''))
-          startWorkers($, latexFont)
-          // Messages drawn before TeX was found left their blocks as code.
-          // Draw them again now that blocks can compile.
-          await update($, version, n => n + 1).catch(() => undefined)
-        }
-      }
+      await setUpTex($)
 
       await step($, 'settings rows', async () => {
         const keys = (await $.config.list()).map(row => row.key).filter(key => key.startsWith('latex'))
         debug($, `     keys ${JSON.stringify(keys)}`)
       })
-      await step($, 'register /latex', () => $.command.register({ name: 'latex', description: 'Open the LaTeX mod settings' }))
+      await step($, 'register /latex', () =>
+        $.command.register({ name: 'latex', description: 'Open the LaTeX mod settings. /latex setup checks your TeX install; /latex reload reads the macros file again', argumentHint: '[setup|reload]' }),
+      )
       await step($, 'welcome band', async () => {
         if (!(await $.store.get(INTRO_SEEN))) await update($, intro, () => true)
       })
@@ -534,8 +619,21 @@ export const register: Register = (on, options) => {
     return { ...edited, decorations: [...(edited.decorations ?? []), ...promptDecorations(edited.text, terminalStyle, unicodeMacros)] }
   }).catch(async ($, e, next) => next(e))
 
-  on('command.run', { command: 'latex' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'LaTeX settings' })
+  // /latex opens the settings. /latex setup says what the setup check
+  // found, as text, so it reads in any surface. /latex reload reads the
+  // macros file again.
+  on('command.run', { command: 'latex' }, async ($, e) => {
+    const word = e.args.trim().toLowerCase()
+    if (word === 'setup' || word === 'doctor' || word === 'check') {
+      await setUpTex($)
+      return { text: setupReport ? describeSetup(setupReport).join('\n') : 'The setup check has not run yet.' }
+    }
+    if (word === 'reload') {
+      await reloadMacros($)
+      return { text: macrosInfo.exists ? `Read ${macrosInfo.count} macros from ${macrosInfo.path}.${macrosInfo.error ? ` Error: ${macrosInfo.error}` : ''}` : `No macros file at ${macrosInfo.path}.` }
+    }
+    // Tall enough to show every setting where the terminal opens it inline.
+    await $.ui.open({ id: PANE, title: 'LaTeX settings', rows: 60, closeOnEscape: true })
     return { text: 'Opened the LaTeX settings.' }
   })
 
@@ -648,7 +746,9 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
-    const useLatex = latexFont !== null && tex !== null
+    // The font this drawing typesets in, fixed for the whole drawing.
+    const font = latexFont
+    const useLatex = font !== null && tex !== null
     let isWaiting = false
     // What this drawing hands the app, for the debug log.
     const handed = { svgs: 0, svgChars: 0 }
@@ -662,7 +762,7 @@ export const register: Register = (on, options) => {
     // as a LaTeX block would be.
     const canFallBack = blocksOn && tex !== null
     const fallbackBlock = (p: { source: string }) => ({ lang: 'latex' as const, source: p.source })
-    const blockKey = (p: { lang: BlockJob['lang']; source: string }) => hashOf('block', latexFont ?? 'cm', p.lang, macros, p.source)
+    const blockKey = (p: { lang: BlockJob['lang']; source: string }) => hashOf('block', font ?? 'cm', p.lang, macros, p.source)
     const compiled = (p: { lang: BlockJob['lang']; source: string }) => {
       const key = blockKey(p)
       const result = resultOf(key)
@@ -687,7 +787,7 @@ export const register: Register = (on, options) => {
             ? [{ tex: p.tex, display: true }]
             : p.lines.flatMap(l => l.spans.flatMap(sp => (sp.kind === 'math' ? [{ tex: sp.tex, display: false }] : [])))
         for (const f of formulas) {
-          const key = hashOf('math', latexFont, f.display ? 'D' : 'I', macros, f.tex)
+          const key = hashOf('math', font!, f.display ? 'D' : 'I', macros, f.tex)
           if (!resultOf(key)) await fromDisk($, `m-${key}.svg`, key)
         }
       }
@@ -697,7 +797,7 @@ export const register: Register = (on, options) => {
       el: { Box, Text, Markdown, Svg, Button, Link },
       formula: (source, display) => {
         if (useLatex) {
-          const key = hashOf('math', latexFont, display ? 'D' : 'I', macros, source)
+          const key = hashOf('math', font!, display ? 'D' : 'I', macros, source)
           const typeset = resultOf(key)
           if (typeset && 'svg' in typeset) return count(withInk(typeset.svg, scheme))
           if (!typeset) {
@@ -759,7 +859,18 @@ export const register: Register = (on, options) => {
   // A one-time band above the prompt: what the mod does, where its settings are.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, intro))) return next(e)
+    await read($, setup)
     const { Box, Text, Button } = $.ui.resolve(e)
+    // What the setup check found, in one line: blocks only compile with a
+    // working TeX, so say so where the person first looks.
+    const report = setupReport
+    const setupLine = !report || e.surface === 'terminal' || report.backend === 'mathjax'
+      ? null
+      : !report.toolchain
+        ? { text: 'No LaTeX found, so diagrams stay code. Open settings to see how to install it.', isProblem: true }
+        : report.missing.length
+          ? { text: `LaTeX is missing ${report.missing.length} package${report.missing.length === 1 ? '' : 's'} the mod uses. Open settings to see which.`, isProblem: true }
+          : { text: `Diagrams compile with ${report.toolchain.engine}.`, isProblem: false }
     const dismiss = async () => {
       await $.store.set(INTRO_SEEN, true)
       await update($, intro, () => false)
@@ -772,6 +883,7 @@ export const register: Register = (on, options) => {
             ? 'Math in replies now shows as Unicode text, laid out over several rows for display math. The prompt box colors your Markdown and previews each formula as you type.'
             : 'Math, TikZ and LaTeX blocks in replies now render. You can pick one of 10 math fonts, and choose whether your own messages show their math.'}
         </Text>
+        {setupLine ? <Text color={setupLine.isProblem ? 'warning' : undefined} dimColor={!setupLine.isProblem}>{setupLine.text}</Text> : null}
         <Box flexDirection="row" gap={1}>
           <Button
             key="intro-settings"
@@ -791,13 +903,19 @@ export const register: Register = (on, options) => {
   // The settings pane, opened by /latex or the welcome band. Each change goes
   // through the app's own settings, which reloads the mod with the new value.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    // Redrawn when the setup check or the macros change.
+    await read($, setup)
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
-    // The mobile app has no Select. Show the value as text there.
+    // The mobile app has no Select or Input. Show the value as text there.
     const Select = 'Select' in elements ? elements.Select : undefined
+    const Input = 'Input' in elements ? elements.Input : undefined
     // Each call names its setting in full, so the plugin directory can read
     // which settings the pane changes. A change reloads the mod.
     const saved = (change: Promise<unknown>) => void change.catch(error => debug($, `config.set failed: ${error}`))
+    const setBackend = (value: string) => saved($.config.set({ key: 'latex.backend', value: value }))
+    const setTexPath = (value: string) => saved($.config.set({ key: 'latex.texPath', value: value.trim() }))
+    const setMacrosFile = (value: string) => saved($.config.set({ key: 'latex.macrosFile', value: value.trim() || DEFAULT_MACROS_FILE }))
     const setMathFont = (value: string) => saved($.config.set({ key: 'latex.mathFont', value: value }))
     const setColorScheme = (value: string) => saved($.config.set({ key: 'latex.colorScheme', value: value }))
     const setUserBubble = (value: string) => saved($.config.set({ key: 'latex.userBubble', value: value }))
@@ -806,70 +924,102 @@ export const register: Register = (on, options) => {
     const setTikz = (value: boolean) => saved($.config.set({ key: 'latex.tikz', value: value }))
     const setTerminal = (value: boolean) => saved($.config.set({ key: 'latex.terminal', value: value }))
     const setPromptBox = (value: boolean) => saved($.config.set({ key: 'latex.promptBox', value: value }))
+    const heading = (text: string) => (
+      <Text bold underline>
+        {text}
+      </Text>
+    )
     const toggle = (field: string, label: string, help: string, isOn: boolean, change: (value: boolean) => void) => (
-      <Box flexDirection="column" marginBottom={1}>
+      <Box flexDirection="column">
         <Box flexDirection="row" gap={1}>
-          <Text bold>{label}</Text>
           <Button key={`toggle-${field}`} label={isOn ? 'On' : 'Off'} variant={isOn ? 'primary' : 'secondary'} onPress={() => change(!isOn)} />
+          <Text bold>{label}</Text>
         </Box>
+        <Text dimColor>{help}</Text>
+      </Box>
+    )
+    const choice = (key: string, label: string, value: string, choices: { value: string; label: string }[], change: (value: string) => void, help?: string) => (
+      <Box flexDirection="column">
+        <Text bold>{label}</Text>
+        {Select ? <Select key={key} value={value} options={choices} onSelect={change} /> : <Text>{choices.find(c => c.value === value)?.label ?? value}</Text>}
+        {help ? <Text dimColor>{help}</Text> : null}
+      </Box>
+    )
+    const field = (key: string, label: string, value: string, placeholder: string, change: (value: string) => void, help: string) => (
+      <Box flexDirection="column">
+        <Text bold>{label}</Text>
+        {Input ? <Input key={key} value={value} placeholder={placeholder} submitLabel="Save" onSubmit={change} /> : <Text>{value || placeholder}</Text>}
         <Text dimColor>{help}</Text>
       </Box>
     )
     const fontValue = String(options.mathFont ?? 'mathjax')
     const colorValue = String(options.colorScheme ?? 'auto')
+    const report = setupReport ? describeSetup(setupReport) : ['Checking your TeX install…']
     return (
-      <Box flexDirection="column">
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold>Math font</Text>
-          {Select ? (
-            <Select
-              key="math-font"
-              value={fontValue}
-              options={FONT_CHOICES.map(v => ({ value: v, label: v === 'mathjax' ? 'MathJax (instant)' : v }))}
-              onSelect={setMathFont}
-            />
-          ) : (
-            <Text>{fontValue}</Text>
-          )}
-          <Text dimColor>MathJax draws at once. Any other font is typeset by your own LaTeX, with MathJax shown until it is ready.</Text>
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column">
+          {heading('Setup')}
+          {report.map(line => (
+            <Text dimColor={!/^(To fix|Missing)/.test(line)} color={/^(To fix|Missing)/.test(line) ? 'warning' : undefined}>
+              {line}
+            </Text>
+          ))}
+          <Box flexDirection="row" gap={1}>
+            <Button key="check-setup" label="Check again" onPress={() => void setUpTex($)} />
+          </Box>
         </Box>
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold>Math color</Text>
-          {Select ? (
-            <Select
-              key="math-color"
-              value={colorValue}
-              options={[{ value: 'auto', label: 'Follow the system' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]}
-              onSelect={setColorScheme}
-            />
-          ) : (
-            <Text>{colorValue}</Text>
+        <Box flexDirection="column" gap={1}>
+          {heading('Rendering')}
+          {choice(
+            'backend',
+            'Backend',
+            backend,
+            [
+              { value: 'auto', label: 'Auto: the first installed of LaTeX and XeLaTeX' },
+              { value: 'latex', label: 'LaTeX (latex and dvisvgm, fastest)' },
+              { value: 'xelatex', label: 'XeLaTeX (system fonts and fontspec in blocks)' },
+              { value: 'mathjax', label: 'MathJax only (never runs your TeX)' },
+            ],
+            setBackend,
+            'What typesets LaTeX blocks and the LaTeX fonts. Formulas always show in MathJax first.',
           )}
+          {field('tex-path', 'TeX folder', texPath, 'Found automatically', setTexPath, 'The folder holding latex (or xelatex) and dvisvgm. Leave empty to search the usual places and your PATH.')}
+          {choice('math-font', 'Math font', fontValue, FONT_CHOICES.map(v => ({ value: v, label: v === 'mathjax' ? 'MathJax (instant)' : v })), setMathFont, 'Any font but MathJax is typeset by your LaTeX, with MathJax shown until it is ready.')}
+          {choice('math-color', 'Math color', colorValue, [{ value: 'auto', label: 'Follow the system' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }], setColorScheme)}
+          {toggle('tikz', 'Compile LaTeX blocks', 'tikz, tikzcd and latex code blocks, using your TeX.', blocksOn, setTikz)}
+          {toggle('copyButton', 'Copy TeX button', 'A button under each display formula and LaTeX block.', showCopy, setCopyButton)}
         </Box>
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold>Your messages</Text>
-          {Select ? (
-            <Select
-              key="user-bubble"
-              value={bubbleMode}
-              options={[
-                { value: 'off', label: 'As typed' },
-                { value: 'under', label: 'As typed, with the math under the bubble' },
-                { value: 'rendered', label: 'Rendered: Markdown and math in a bubble (experimental)' },
-              ]}
-              onSelect={setUserBubble}
-            />
-          ) : (
-            <Text>{bubbleMode}</Text>
+        <Box flexDirection="column" gap={1}>
+          {heading('Macros')}
+          {field('macros-file', 'Macros file', macrosOption, DEFAULT_MACROS_FILE, setMacrosFile, '\\newcommand and \\DeclareMathOperator lines every formula can use.')}
+          <Text dimColor>
+            {macrosInfo.exists ? `${macrosInfo.count} definition${macrosInfo.count === 1 ? '' : 's'} read${macrosInfo.error ? `, with an error: ${macrosInfo.error}` : ''}.` : 'There is no file there yet.'}
+          </Text>
+          <Box flexDirection="row" gap={1}>
+            {macrosInfo.exists ? null : <Button key="create-macros" label="Create it with examples" variant="primary" onPress={() => void createMacros($)} />}
+            <Button key="reload-macros" label="Reload macros" onPress={() => void reloadMacros($)} />
+          </Box>
+        </Box>
+        <Box flexDirection="column" gap={1}>
+          {heading('Terminal')}
+          {toggle('terminal', 'Math in the terminal', 'Math in replies as Unicode text, display math over several rows.', terminalOn, setTerminal)}
+          {toggle('promptBox', 'Style the prompt box', 'Color the Markdown you type, render-markdown.nvim style, and preview each formula.', promptOn, setPromptBox)}
+        </Box>
+        <Box flexDirection="column" gap={1}>
+          {heading('Messages')}
+          {choice(
+            'user-bubble',
+            'Your messages',
+            bubbleMode,
+            [
+              { value: 'off', label: 'As typed' },
+              { value: 'under', label: 'As typed, with the math under it' },
+              { value: 'rendered', label: 'Rendered: Markdown and math (experimental)' },
+            ],
+            setUserBubble,
           )}
-          <Text dimColor>How a message you sent is drawn. Rendered draws its own bubble and keeps the app's row under it as a small pill, for the time, rewind and fork controls.</Text>
+          {toggle('tellModel', 'Tell the model how math renders here', 'A short note in the system prompt: the syntax that renders, and the limits.', tellModel, setTellModel)}
         </Box>
-        {toggle('tellModel', 'Tell the model how math renders here', 'Adds a short note to the system prompt: the syntax that renders, and the size limits.', tellModel, setTellModel)}
-        {toggle('copyButton', 'Copy TeX button', 'A button under each display formula and LaTeX block.', showCopy, setCopyButton)}
-        {toggle('tikz', 'Compile LaTeX blocks', 'tikz, tikzcd and latex code blocks, using your TeX install.', blocksOn, setTikz)}
-        {toggle('terminal', 'Math in the terminal', 'Show math in replies as Unicode text when Claude Code runs in a terminal.', terminalOn, setTerminal)}
-        {toggle('promptBox', 'Style the prompt box', 'Color the Markdown you type, render-markdown.nvim style, and preview each formula as Unicode beside it.', promptOn, setPromptBox)}
-        <Text dimColor>Macros file: {String(options.macrosFile || '~/.claude/latex-macros.tex')}. Reopen this pane with /latex.</Text>
       </Box>
     )
   })

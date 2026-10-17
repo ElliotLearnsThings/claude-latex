@@ -172,8 +172,9 @@ test('shows an unknown command as red source, not as an SVG', async $ => {
   await ui.unmount()
 })
 
-// A fake TeX install: latex writes d.dvi, dvisvgm writes one SVG per page.
-function fakeTex(on: On, pages = 1) {
+// A fake TeX install: latex writes d.dvi, dvisvgm writes one SVG per page,
+// and kpsewhich finds every package but those named `missing`.
+function fakeTex(on: On, pages = 1, missing: string[] = []) {
   const files = new Map<string, string>()
   const runs: string[][] = []
   const sandboxed: boolean[] = []
@@ -208,11 +209,16 @@ function fakeTex(on: On, pages = 1) {
       files.delete(from)
     }
     if (e.argv[0]?.endsWith('/latex')) files.set(`${cwd}/d.dvi`, 'dvi')
+    if (e.argv[0]?.endsWith('/xelatex') && !e.argv.includes('-ini')) files.set(`${cwd}/d.xdv`, 'xdv')
     if (e.argv[0]?.endsWith('/dvisvgm')) {
       if (e.argv.includes('d.svg')) files.set(`${cwd}/d.svg`, "<svg width='10pt' height='5pt'><path d=''/></svg>")
       else for (let i = 1; i <= pages; i++) files.set(`${cwd}/d-${i}.svg`, `<svg width='${i}pt' height='5pt'></svg>`)
     }
     if (e.argv[0] === '/bin/rm') for (const p of [...files.keys()]) if (p.startsWith(e.argv[2] + '/')) files.delete(p)
+    if (e.argv[0]?.endsWith('/kpsewhich')) {
+      const found = e.argv.slice(1).filter(file => !missing.includes(file))
+      return { value: { exitCode: 0, stdout: found.map(file => `/usr/share/texmf/${file}\n`).join(''), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return { files, runs, sandboxed }
@@ -273,6 +279,72 @@ test('with a LaTeX font, typesets a message in one run and swaps it in', { optio
   expect(source).toBeDefined()
   const after = await ui.findAll({ type: 'Svg' })
   expect(after.map(s => String(s.props.source).match(/width='(\d)pt'/)?.[1])).toEqual(['1', '2'])
+  await ui.unmount()
+})
+
+test('a LaTeX font whose package is missing falls back to MathJax, and the setup check says how to install it', { options: { mathFont: 'palatino' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/Users/test', PATH: '' })
+  on('ui.log', async () => ({ value: undefined }))
+  const { runs } = fakeTex(on, 2, ['newpxmath.sty', 'standalone.cls'])
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('Both $a^2$ and $b^2$ here.') })
+  expect(await ui.findAll({ type: 'Svg' })).toHaveLength(2)
+  await clock.advance(100)
+  await clock.advance(100)
+  // No formula is sent to LaTeX: MathJax draws them.
+  expect(runs.filter(argv => argv[0]?.endsWith('/latex') && !argv.includes('-ini') && argv.includes('d.tex'))).toHaveLength(0)
+  await ui.unmount()
+  const report = await $.command.run({ command: 'latex', args: 'setup' } as never)
+  expect(report.text).toContain('Missing LaTeX packages: standalone.cls, newpxmath.sty')
+  expect(report.text).toContain('To fix:')
+})
+
+test('the setup check reports where TeX is, and MathJax only when asked', { options: { backend: 'mathjax' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/Users/test', PATH: '' })
+  fakeTex(on)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  const report = await $.command.run({ command: 'latex', args: 'setup' } as never)
+  expect(report.text).toContain('MathJax only')
+  // A tikz block stays code: nothing is compiled.
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('```tikz\n\\draw (0,0) -- (1,1);\n```\n\nand $x$') })
+  expect(await ui.find({ type: 'Text', text: /Compiling/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the xelatex backend writes XDV and hands it to dvisvgm', { options: { backend: 'xelatex' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/Users/test', PATH: '' })
+  const { runs } = fakeTex(on)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('```latex\n\\usepackage{fontspec}\nZürich\n```') })
+  for (let i = 0; i < 3; i++) await clock.advance(100)
+  const compile = runs.find(argv => argv[0]?.endsWith('/xelatex') && !argv.includes('-ini'))
+  expect(compile).toContain('-no-pdf')
+  expect(runs.find(argv => argv[0]?.endsWith('/dvisvgm'))).toContain('d.xdv')
+  // Its saved formats are its own: a latex format would not load.
+  expect(runs.find(argv => argv.includes('-ini'))).toContain('&xelatex')
+  expect(await ui.findAll({ type: 'Svg' })).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('creates a macros file from the template and reads it', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/Users/test', PATH: '' })
+  const { files } = fakeTex(on)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  const pane = await $.ui.mount<'desktop', 'Pane'>({ plugin: 'latex', surface: 'desktop', component: 'Pane', props: { title: 'LaTeX settings', isFocused: true, bodyColumns: 80, placement: 'dock' } as never, requestId: 'latex-settings' } as never)
+  await pane.press({ key: 'create-macros' })
+  expect(files.get('/Users/test/.claude/latex-macros.tex')).toContain('\\newcommand{\\R}{\\mathbb{R}}')
+  expect(await pane.find({ type: 'Text', text: /definitions read/ })).toBeDefined()
+  await pane.unmount()
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'terminal', component: 'AssistantMessage', props: reply('Take $x \\in \\R^n$.') })
+  expect(await ui.find({ type: 'Text', text: /x ∈ ℝⁿ/ })).toBeDefined()
   await ui.unmount()
 })
 

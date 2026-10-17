@@ -3,9 +3,12 @@
 export type CompileVersion = number
 // Whether the one-time welcome band shows above the prompt.
 export type IntroVisible = boolean
+// Goes up each time the setup check or the macros file is read again, which
+// redraws the settings pane.
+export type SetupVersion = number
 
 declare module 'claude-code' {
   interface PluginState {
-    latex: { version: CompileVersion; intro: IntroVisible }
+    latex: { version: CompileVersion; intro: IntroVisible; setup: SetupVersion }
   }
 }

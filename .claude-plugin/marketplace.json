@@ -8,7 +8,7 @@
     {
       "name": "latex",
       "source": "./",
-      "description": "Render TeX math, TikZ diagrams and LaTeX blocks in Claude Code's desktop app, in any of 10 LaTeX fonts, with every LaTeX compile sandboxed. In the terminal, math shows as Unicode and the prompt box previews it as you type"
+      "description": "Render TeX math, TikZ diagrams and LaTeX blocks in Claude Code's desktop app, in any of 10 LaTeX fonts, with every LaTeX compile sandboxed on macOS and Linux. In the terminal, math shows as Unicode and the prompt box previews it as you type"
     }
   ]
 }
