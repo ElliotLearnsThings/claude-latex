@@ -97,6 +97,14 @@ test('reads formulas left to right, and leaves code spans alone', async $ => {
   await ui.unmount()
 })
 
+test('a dollar inside a code span never closes a formula', async $ => {
+  const text = 'This costs $5 and $10, and `$HOME` stays code. Then $x^2$.'
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply(text) })
+  expect((await ui.findAll({ type: 'Svg' })).map(svg => String(svg.props.alt))).toEqual(['x^2'])
+  expect(await ui.find({ type: 'Text', text: /\$HOME/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a macro defined in one formula does not reach the next', async $ => {
   const text = 'First $\\renewcommand{\\alpha}{\\text{changed}}\\alpha$ then $\\alpha$.'
   const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply(text) })
@@ -316,8 +324,13 @@ test('tells the model how math renders, where the mod draws', async ($, on) => {
   const note = onDesktop.sections.find(section => section.id === 'latex:rendering')
   expect(note?.text).toContain('235 KB')
   expect(note?.text).toContain('```tex')
+  // In a terminal the note says math shows as Unicode, and blocks as code.
   const inTerminal = await $.prompt.compose({ ...facts, surfaces: ['terminal'] } as never)
-  expect(inTerminal.sections.map(section => section.id)).toEqual(['intro'])
+  const terminalNote = inTerminal.sections.find(section => section.id === 'latex:rendering')
+  expect(terminalNote?.text).toContain('Unicode')
+  expect(terminalNote?.text).not.toContain('235 KB')
+  const headless = await $.prompt.compose({ ...facts, surfaces: [] } as never)
+  expect(headless.sections.map(section => section.id)).toEqual(['intro'])
 })
 
 test('the note to the model can be turned off', { options: { tellModel: false } }, async ($, on) => {
@@ -365,7 +378,7 @@ test('the settings pane changes the real settings', async ($, on) => {
   on('config.list', async () => ({ value: [{ key: 'latex.copyButton', label: 'Copy TeX button', kind: 'boolean', value: false, provider: { kind: 'plugin', name: 'latex' }, isLocked: false }] as never }))
   on('config.set', async ($, e) => {
     sets.push(e)
-    return { value: { value: e.value } as never }
+    return { value: e.value }
   })
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
   const pane = await $.ui.mount<'desktop', 'Pane'>({ plugin: 'latex', surface: 'desktop', component: 'Pane', props: { title: 'LaTeX settings', isFocused: true, bodyColumns: 60, placement: 'dock' } as never, requestId: 'latex-settings' } as never)

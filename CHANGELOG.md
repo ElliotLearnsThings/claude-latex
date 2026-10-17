@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0
+
+- Math renders in a terminal. Each formula becomes Unicode text in the math color: inline math in the line (`\alpha^2 + \frac{1}{2}` reads `α² + ½`), display math laid out over several rows, with stacked fractions, sums with their bounds above and below, matrices and cases in tall brackets and `align` rows lined up. Math alphabets (`\mathbb`, `\mathcal`, `\mathfrak`, `\bm`), accents, `\ce` and the macros file all apply. LaTeX blocks stay code. The **Math in the terminal** setting turns it off.
+- The prompt box is painted as you type, the way render-markdown.nvim paints a Markdown buffer: headings on a colored band, list markers, checkboxes, quotes, emphasis, links and code, in Rosé Pine (Dawn on a light terminal). Each formula is colored and previewed as Unicode beside it. The **Style the prompt box** setting turns it off.
+- In a terminal the model is told that math shows as Unicode there and that LaTeX blocks are not compiled.
+- Your messages in a terminal follow the **Your messages** setting: `under` shows their math below the row, `rendered` draws the whole message.
+- The settings pane test answers `config.set` with a plain value, as the engine now requires.
+- A dollar inside a code span no longer closes a formula: `$5 and $10, and \`$HOME\`` was drawn as math, on the desktop too.
+- The Unicode conversion is bounded: a macro that calls itself stops after 1000 expansions, groups nest at most 60 deep, and a formula over 20,000 characters is shown as written, so no formula can stall a render or a key press.
+- Macros a formula defines itself apply within it, `\over`, `\choose` and `\atop` work, a one-line fraction gets brackets beside other terms (`(a/b)c`), and side-by-side stacked fractions and sums keep a gap.
+- In a terminal, links keep their address, and a display formula wider than the window is drawn on one line instead of wrapping row by row.
+
 ## 0.5.0
 
 - Your messages can render as Markdown with math, in a bubble. This is the experimental `rendered` value of the new **Your messages** setting. The app's own row stays under the bubble as a small pill, so the time, rewind and fork controls are kept. Your messages are now left as typed by default. `under` brings back the math under the app's bubble.
