@@ -6,12 +6,13 @@ export type BlockLang = 'tikz' | 'tikzcd' | 'latex'
 // `interrupted`: stopped from outside (a reload, a killed process), not a
 // TeX error, so worth one more try.
 export type Rendered = { svg: string } | { error: string; interrupted?: boolean }
-export type MathJob = { key: string; tex: string; display: boolean }
+// `font` is the one the job's key was made with: it compiles in that one.
+export type MathJob = { key: string; tex: string; display: boolean; font?: LatexFont }
 // A document in two parts. `base` is the class and the fixed preamble, the
 // same for every document of one kind and font, so it can be saved once as a
 // LaTeX format and reused. `rest` is everything that changes per document.
 export type TexDoc = { kind: string; base: string; rest: string }
-export type BlockJob = { key: string; lang: BlockLang; source: string }
+export type BlockJob = { key: string; lang: BlockLang; source: string; font?: LatexFont }
 
 // Font packages for latex in DVI mode. Each line has been compiled with
 // TeX Live 2026 and converted with dvisvgm --no-fonts.
@@ -98,8 +99,10 @@ export function takeBlock(): BlockJob | undefined {
   return next.value
 }
 
+// Up to `max` formulas of one font: one LaTeX run typesets them together.
 export function takeMathBatch(max: number): MathJob[] {
-  const batch = [...mathQueue.values()].slice(0, max)
+  const queued = [...mathQueue.values()]
+  const batch = queued.filter(job => job.font === queued[0]?.font).slice(0, max)
   for (const job of batch) {
     mathQueue.delete(job.key)
     inFlight.add(job.key)

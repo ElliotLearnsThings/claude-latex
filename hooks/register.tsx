@@ -8,16 +8,19 @@ import { DARK_STYLE, isLightTerminal, LIGHT_STYLE } from './style'
 import { drawTerminal } from './terminal'
 import { readMacros, texToUnicode, texToUnicodeLines } from './unicode'
 import { countDefinitions, MACROS_TEMPLATE } from './macros'
-import { BWRAP_CANDIDATES, macProfile, SANDBOX_EXEC, sandboxed, type Sandbox } from './sandbox'
+import { BWRAP_CANDIDATES, HIDDEN_ROOTS, macProfile, outermost, sandboxed, type Sandbox } from './sandbox'
 import {
   BACKENDS,
   describeSetup,
   FONT_FILES,
   findToolchain,
+  installerOf,
   isBackend,
   missingFiles,
   platformOf,
   searchFolders,
+  texVariable,
+  versionOf,
   type Backend,
   type SetupReport,
   type Toolchain,
@@ -181,7 +184,10 @@ function isTurnRunning(): boolean {
 // Compiles queued blocks and formulas, up to MAX_WORKERS at once, and
 // redraws waiting messages as results land.
 let workersStarted = false
-function startWorkers($: Engine, latexFont: LatexFont | null): void {
+// Each job carries the font its key was made with, so a font that changes
+// after the workers start (an install, then Check again) never compiles a
+// job in another font than its cache key says.
+function startWorkers($: Engine): void {
   if (workersStarted) return
   workersStarted = true
   let running = 0
@@ -198,14 +204,13 @@ function startWorkers($: Engine, latexFont: LatexFont | null): void {
     }
     while (running < MAX_WORKERS && hasQueued()) {
       const block = takeBlock()
-      const batch = block || !latexFont ? [] : takeMathBatch(60)
+      const batch = block ? [] : takeMathBatch(60)
       if (!block && batch.length === 0) break
       running += 1
       void (async () => {
         if (block) {
-          const font = latexFont ?? 'cm'
           const compileStarted = Date.now()
-          const result = await compileBlock($, block, font).catch(describeFailure)
+          const result = await compileBlock($, block, block.font ?? 'cm').catch(describeFailure)
           const tries = retries.get(block.key) ?? 0
           const outcome = 'svg' in result ? `${result.svg.length} chars` : `error${result.interrupted ? ' (interrupted)' : ''}: ${result.error.split('\n')[0]}`
           debug($, `compiled ${block.lang} ${block.key}, try ${tries + 1}: ${outcome}, ${Date.now() - compileStarted} ms | ${JSON.stringify(block.source.slice(0, 40))}`)
@@ -216,8 +221,8 @@ function startWorkers($: Engine, latexFont: LatexFont | null): void {
           } else {
             setResult(block.key, result)
           }
-        } else if (latexFont) {
-          await compileMath($, batch, latexFont).catch(() => {
+        } else if (batch[0]?.font) {
+          await compileMath($, batch, batch[0].font).catch(() => {
             for (const job of batch) setResult(job.key, { error: 'compile failed' })
           })
         }
@@ -238,30 +243,77 @@ let sandboxNote = 'off'
 // TeX's own write guard: no writing outside the build folder.
 const TEX_ENV = { openout_any: 'p', openin_any: 'p' }
 
-function texArgv(argv: string[]): string[] {
-  return sandboxed(sandbox, argv)
+// A TeX command in the sandbox, when there is one, writing only `workdir`.
+function texArgv(argv: string[], workdir: string): string[] {
+  return sandboxed(sandbox, argv, workdir)
 }
 
-// Tries each sandbox this machine may have, keeping the first whose probe
-// runs.
-async function setupSandbox($: Engine, home: string): Promise<void> {
-  if (!tex || !home) return
-  const { cacheDir } = tex
-  const profile = `${cacheDir}/sandbox.sb`
-  await $.fs.write(profile, macProfile(home, cacheDir))
-  const candidates: Sandbox[] = [{ kind: 'macos', profile }]
-  for (const bwrap of BWRAP_CANDIDATES) {
-    if (await $.fs.exists(bwrap).catch(() => false)) candidates.push({ kind: 'bwrap', bwrap, home, cacheDir })
+// Where a path really is, through any link: a sandbox mounts real paths.
+async function realPath($: Engine, path: string): Promise<string> {
+  const stat = await $.fs.stat(path, { resolve: true }).catch(() => null)
+  return stat?.realPath ?? path
+}
+
+// The folders TeX's own settings name, through any link.
+async function texFolders($: Engine, toolchain: Toolchain, names: string[]): Promise<string[]> {
+  const dirs: string[] = []
+  for (const name of names) {
+    for (const dir of (await texVariable($, toolchain, name)).split(/[:;]/)) {
+      const path = dir.replace(/^!!/, '')
+      if (path.startsWith('/')) dirs.push(await realPath($, path))
+    }
   }
+  return dirs
+}
+
+// Tries each sandbox this machine may have, keeping the first in which the
+// typesetter itself runs: a probe of /usr/bin/true can pass where TeX, under
+// the home folder, could not start.
+async function setupSandbox($: Engine, home: string): Promise<void> {
+  sandbox = null
+  sandboxNote = 'off'
+  if (!tex || !home) return
+  const { cacheDir, toolchain } = tex
+  const probeDir = `${cacheDir}/build/probe`
+  await $.fs.write(`${probeDir}/.keep`, '')
+  const realHome = await realPath($, home)
+  const realCache = await realPath($, cacheDir)
+  const profile = `${cacheDir}/sandbox.sb`
+  await $.fs.write(profile, macProfile(realHome, realCache))
+  const candidates: Sandbox[] = [{ kind: 'macos', profile }]
+  const bwraps: string[] = []
+  for (const bwrap of BWRAP_CANDIDATES) if (await $.fs.exists(bwrap).catch(() => false)) bwraps.push(bwrap)
+  if (bwraps.length) {
+    // Every home and removable-media folder is hidden. TeX's own folders,
+    // user fonts, a TeX installed under the home folder and the mod's cache
+    // come back read-only; TeX's var tree comes back writable.
+    const hidden = [realHome]
+    for (const dir of HIDDEN_ROOTS) if (await $.fs.exists(dir).catch(() => false)) hidden.push(await realPath($, dir))
+    const readable = [
+      ...(await texFolders($, toolchain, ['TEXMFHOME', 'TEXMFCONFIG', 'TEXMFROOT'])),
+      await realPath($, toolchain.bin),
+      `${realHome}/.fonts`,
+      `${realHome}/.local/share/fonts`,
+      `${realHome}/.cache/fontconfig`,
+      realCache,
+    ]
+    const writable = await texFolders($, toolchain, ['TEXMFVAR'])
+    for (const bwrap of bwraps) candidates.push({ kind: 'bwrap', bwrap, hidden: outermost(hidden), readable, writable })
+  }
+  const failures: string[] = []
   for (const candidate of candidates) {
-    const probe = await $.process.run(sandboxed(candidate, ['/usr/bin/true']), { cwd: cacheDir, timeoutMs: 10000 }).catch(() => null)
-    if (probe?.exitCode === 0) {
+    const probe = await $.process
+      .run(sandboxed(candidate, [toolchain.typesetter, '--version'], probeDir), { cwd: probeDir, timeoutMs: 15000 })
+      .catch((error: unknown) => ({ exitCode: -1, stdout: '', stderr: String(error) }))
+    if (probe.exitCode === 0) {
       sandbox = candidate
       sandboxNote = candidate.kind === 'macos' ? 'on (macOS sandbox-exec)' : `on (bubblewrap, ${candidate.bwrap})`
       return
     }
+    if (candidate.kind === 'bwrap' && probe.stderr.trim()) failures.push(probe.stderr.trim().split('\n')[0]!)
   }
-  sandboxNote = 'off: neither sandbox-exec nor bubblewrap (bwrap) runs here, so LaTeX blocks run without a sandbox'
+  const why = bwraps.length ? `bubblewrap could not start TeX here (${failures[0] ?? 'no reason given'})` : 'neither sandbox-exec nor bubblewrap (bwrap) is here'
+  sandboxNote = `off: ${why}, so LaTeX blocks run without a sandbox`
   $.ui.log('latex: could not sandbox LaTeX here, so LaTeX blocks run without a sandbox', { to: 'debug' })
 }
 let macros = ''
@@ -296,7 +348,7 @@ async function buildFormat($: Engine, name: string, base: string): Promise<strin
   const temp = `${name}-${Math.random().toString(36).slice(2, 8)}`
   await $.fs.write(`${dir}/${temp}.tex`, `${base}\n\\dump\n`)
   const { engine, typesetter } = tex!.toolchain
-  await $.process.run(texArgv([typesetter, '-ini', '-interaction=nonstopmode', `-jobname=${temp}`, `&${engine}`, `${temp}.tex`]), {
+  await $.process.run(texArgv([typesetter, '-ini', '-interaction=nonstopmode', `-jobname=${temp}`, `&${engine}`, `${temp}.tex`], dir), {
     cwd: dir,
     env: TEX_ENV,
     timeoutMs: 120000,
@@ -307,8 +359,11 @@ async function buildFormat($: Engine, name: string, base: string): Promise<strin
   return (await $.fs.exists(`${path}.fmt`)) ? path : null
 }
 
+// A format loads only in the TeX that dumped it, so its name carries the
+// TeX's place and version: another install builds its own.
 function formatName(doc: TexDoc): string {
-  return `fmt-${tex!.toolchain.engine}-${doc.kind}-${hashOf(doc.base)}`
+  const { engine, typesetter, version } = tex!.toolchain
+  return `fmt-${engine}-${doc.kind}-${hashOf(doc.base, typesetter, version ?? '')}`
 }
 
 function formatFor($: Engine, doc: TexDoc): Promise<string | null> {
@@ -331,7 +386,7 @@ async function runTex($: Engine, dir: string, doc: TexDoc, dvisvgmArgs: string[]
   const latex = async (source: string, fmt: string | null) => {
     await $.fs.write(`${dir}/d.tex`, source)
     return $.process.run(
-      texArgv([typesetter, ...(fmt ? [`-fmt=${fmt}`] : []), ...(engine === 'xelatex' ? ['-no-pdf'] : []), '-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', 'd.tex']),
+      texArgv([typesetter, ...(fmt ? [`-fmt=${fmt}`] : []), ...(engine === 'xelatex' ? ['-no-pdf'] : []), '-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', 'd.tex'], dir),
       { cwd: dir, env: TEX_ENV, timeoutMs: 60000 },
     )
   }
@@ -349,7 +404,10 @@ async function runTex($: Engine, dir: string, doc: TexDoc, dvisvgmArgs: string[]
       const isTexError = run.stdout.includes('\n!') || run.stdout.startsWith('!')
       return isTexError ? { error: texError(run.stdout) } : { error: 'The compile was interrupted.', interrupted: true }
     }
-    const dvisvgm = await $.process.run(texArgv([dvisvgmPath, '--no-fonts', '--precision=2', ...dvisvgmArgs, output]), {
+    // No PostScript specials: dvisvgm runs their PostScript in Ghostscript,
+    // which can open and write files. TikZ, pgfplots, colors and rotations
+    // draw through dvisvgm's own specials and do not need them.
+    const dvisvgm = await $.process.run(texArgv([dvisvgmPath, '--no-fonts', '--no-specials=ps', '--precision=2', ...dvisvgmArgs, output], dir), {
       cwd: dir,
       env: TEX_ENV,
       timeoutMs: 60000,
@@ -368,6 +426,8 @@ async function runTex($: Engine, dir: string, doc: TexDoc, dvisvgmArgs: string[]
 }
 
 async function compileBlock($: Engine, job: BlockJob, font: LatexFont): Promise<Rendered> {
+  // A check that found no TeX may have run since the job was queued.
+  if (!tex) return { error: 'No TeX is set up. Run /latex setup.' }
   const cached = `${tex!.cacheDir}/b-${job.key}.svg`
   if (await $.fs.exists(cached)) return { svg: await $.fs.read(cached) }
   const out = await runTex($, `${tex!.cacheDir}/build/b-${job.key}`, documentForBlock(job, font, macros), [
@@ -391,6 +451,10 @@ async function compileBlock($: Engine, job: BlockJob, font: LatexFont): Promise<
 // Typesets a batch of formulas in one LaTeX run, one page each. If the run
 // fails, each formula is tried alone so one bad formula costs only itself.
 async function compileMath($: Engine, jobs: MathJob[], font: LatexFont): Promise<void> {
+  if (!tex) {
+    for (const job of jobs) setResult(job.key, { error: 'No TeX is set up.' })
+    return
+  }
   const todo: MathJob[] = []
   for (const job of jobs) {
     const cached = `${tex!.cacheDir}/m-${job.key}.svg`
@@ -464,22 +528,36 @@ async function loadMacros($: Engine): Promise<void> {
 async function checkSetup($: Engine): Promise<boolean> {
   const { chosenFont, backend, texPath } = settings
   const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
-  const folders = searchFolders(texPath, path, home)
+  const { folders, problem } = searchFolders(texPath, path, home)
   const ready = await findTex($, home, backend, folders)
-  debug($, `     TeX ${ready ? `${tex!.toolchain.engine} at ${tex!.toolchain.bin}` : 'not found'}`)
-  const missing = ready ? await missingFiles($, tex!.toolchain, chosenFont) : []
+  if (tex) tex.toolchain.version = await versionOf($, tex.toolchain)
+  debug($, `     TeX ${tex ? `${tex.toolchain.engine} at ${tex.toolchain.bin}, ${tex.toolchain.version}` : problem ?? 'not found'}`)
+  const missing = tex ? await missingFiles($, tex.toolchain, chosenFont) : []
   latexFont = chosenFont
-  if (chosenFont && (!ready || missing.some(file => file === FONT_FILES[chosenFont]))) {
+  if (chosenFont && (!ready || missing.some(file => FONT_FILES[chosenFont]?.includes(file)))) {
     latexFont = null
     $.ui.log(ready ? `latex: the ${chosenFont} font is not installed, so math uses MathJax. Run /latex setup for how to install it.` : 'latex: no latex and dvisvgm found, so math uses MathJax')
   }
   if (missing.length) debug($, `     missing ${missing.join(' ')}`)
-  setupReport = { backend, toolchain: tex?.toolchain ?? null, folders, missing, sandbox: sandboxNote, platform: await platformOf($), macros: macrosInfo }
+  const platform = await platformOf($)
+  setupReport = {
+    backend,
+    toolchain: tex?.toolchain ?? null,
+    folders,
+    ...(problem ? { problem } : {}),
+    missing,
+    isSandboxed: sandbox !== null,
+    sandbox: sandboxNote,
+    platform,
+    installer: await installerOf($, platform, tex?.toolchain ?? null),
+    fontChosen: chosenFont !== null,
+    macros: macrosInfo,
+  }
   return ready
 }
 
 async function bumpSetup($: Engine): Promise<void> {
-  if (setupReport) setupReport = { ...setupReport, sandbox: sandboxNote, macros: macrosInfo }
+  if (setupReport) setupReport = { ...setupReport, isSandboxed: sandbox !== null, sandbox: sandboxNote, macros: macrosInfo }
   await update($, setup, n => n + 1).catch(() => undefined)
 }
 
@@ -508,7 +586,7 @@ async function setUpTex($: Engine): Promise<void> {
       void formatFor($, documentForBlock({ key: '', lang: 'tikz', source: '' }, font, ''))
       void formatFor($, documentForBlock({ key: '', lang: 'latex', source: '' }, font, ''))
       if (latexFont) void formatFor($, documentForMath([], latexFont, ''))
-      startWorkers($, latexFont)
+      startWorkers($)
       // Messages drawn before TeX was found left their blocks as code.
       // Draw them again now that blocks can compile.
       await update($, version, n => n + 1).catch(() => undefined)
@@ -762,12 +840,14 @@ export const register: Register = (on, options) => {
     // as a LaTeX block would be.
     const canFallBack = blocksOn && tex !== null
     const fallbackBlock = (p: { source: string }) => ({ lang: 'latex' as const, source: p.source })
-    const blockKey = (p: { lang: BlockJob['lang']; source: string }) => hashOf('block', font ?? 'cm', p.lang, macros, p.source)
+    // XeLaTeX draws some blocks differently, so its results are kept apart.
+    const engineTag = tex?.toolchain.engine === 'xelatex' ? ['xelatex'] : []
+    const blockKey = (p: { lang: BlockJob['lang']; source: string }) => hashOf('block', ...engineTag, font ?? 'cm', p.lang, macros, p.source)
     const compiled = (p: { lang: BlockJob['lang']; source: string }) => {
       const key = blockKey(p)
       const result = resultOf(key)
       if (!result) {
-        requestBlock({ key, lang: p.lang, source: p.source })
+        requestBlock({ key, lang: p.lang, source: p.source, font: font ?? 'cm' })
         isWaiting = true
         return undefined
       }
@@ -787,7 +867,7 @@ export const register: Register = (on, options) => {
             ? [{ tex: p.tex, display: true }]
             : p.lines.flatMap(l => l.spans.flatMap(sp => (sp.kind === 'math' ? [{ tex: sp.tex, display: false }] : [])))
         for (const f of formulas) {
-          const key = hashOf('math', font!, f.display ? 'D' : 'I', macros, f.tex)
+          const key = hashOf('math', ...engineTag, font!, f.display ? 'D' : 'I', macros, f.tex)
           if (!resultOf(key)) await fromDisk($, `m-${key}.svg`, key)
         }
       }
@@ -797,11 +877,11 @@ export const register: Register = (on, options) => {
       el: { Box, Text, Markdown, Svg, Button, Link },
       formula: (source, display) => {
         if (useLatex) {
-          const key = hashOf('math', font!, display ? 'D' : 'I', macros, source)
+          const key = hashOf('math', ...engineTag, font!, display ? 'D' : 'I', macros, source)
           const typeset = resultOf(key)
           if (typeset && 'svg' in typeset) return count(withInk(typeset.svg, scheme))
           if (!typeset) {
-            requestMath({ key, tex: source, display })
+            requestMath({ key, tex: source, display, font: font! })
             isWaiting = true
           }
         }

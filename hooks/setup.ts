@@ -27,6 +27,8 @@ export type Toolchain = {
   dvisvgm: string
   // kpsewhich, to check packages.
   kpsewhich?: string
+  // The first line of `latex --version`: saved formats are tied to it.
+  version?: string
 }
 
 // The files the mod's documents load: the class, the math packages every
@@ -46,19 +48,36 @@ export const REQUIRED_FILES = [
   'pgfplots.sty',
 ]
 
-// The package each LaTeX math font loads. TeX Live installs most of them
-// only with its larger font collections (texlive-fonts-extra).
-export const FONT_FILES: Record<string, string> = {
-  cm: 'amsmath.sty',
-  libertinus: 'libertinus-type1.sty',
-  palatino: 'newpxmath.sty',
-  times: 'newtxmath.sty',
-  euler: 'eulervm.sty',
-  concrete: 'ccfonts.sty',
-  fourier: 'fourier.sty',
-  stix2: 'stix2.sty',
-  kpfonts: 'kpfonts.sty',
-  cmbright: 'cmbright.sty',
+// The packages each LaTeX math font loads (texjobs.ts FONTS). TeX Live
+// installs most of them only with its larger font collections.
+export const FONT_FILES: Record<string, string[]> = {
+  cm: ['amssymb.sty'],
+  libertinus: ['libertinus-type1.sty', 'newtxmath.sty'],
+  palatino: ['newpxtext.sty', 'newpxmath.sty'],
+  times: ['newtxtext.sty', 'newtxmath.sty'],
+  euler: ['amssymb.sty', 'eulervm.sty'],
+  concrete: ['amssymb.sty', 'ccfonts.sty', 'eulervm.sty'],
+  fourier: ['fourier.sty', 'eufrak.sty'],
+  stix2: ['stix2.sty'],
+  kpfonts: ['kpfonts.sty'],
+  cmbright: ['amssymb.sty', 'cmbright.sty'],
+}
+
+// The TeX Live package each file comes in, where its name differs.
+const TL_PACKAGE: Record<string, string> = {
+  'tikz.sty': 'pgf',
+  'bm.sty': 'tools',
+  'amsmath.sty': 'amsmath',
+  'amssymb.sty': 'amsfonts',
+  'eufrak.sty': 'amsfonts',
+  'newpxtext.sty': 'newpx',
+  'newpxmath.sty': 'newpx',
+  'newtxtext.sty': 'newtx',
+  'newtxmath.sty': 'newtx',
+  'stix2.sty': 'stix2-type1',
+}
+export function packageOf(file: string): string {
+  return TL_PACKAGE[file] ?? file.replace(/\.(sty|cls)$/, '')
 }
 
 export function isBackend(value: unknown): value is Backend {
@@ -66,11 +85,17 @@ export function isBackend(value: unknown): value is Backend {
 }
 
 // The folders to look in: the one the settings name, else the usual places
-// and the PATH. A leading ~ is the home folder.
-export function searchFolders(texPath: string, path: string, home: string): string[] {
+// and the PATH. A leading ~ is the home folder. A path to latex or dvisvgm
+// itself means its folder. A relative path is refused: the compiles run in
+// another folder, where it would lead elsewhere.
+export function searchFolders(texPath: string, path: string, home: string): { folders: string[]; problem?: string } {
   const own = texPath.trim().replace(/^~(?=\/|$)/, home)
-  if (own) return [own.replace(/\/+$/, '') || '/']
-  return [...new Set([...BIN_CANDIDATES, ...path.split(':').filter(Boolean)])]
+  if (own) {
+    if (!own.startsWith('/')) return { folders: [], problem: `TeX folder "${texPath}" is not an absolute path` }
+    const folder = own.replace(/\/+$/, '').replace(/\/(latex|xelatex|dvisvgm|kpsewhich)$/, '')
+    return { folders: [folder || '/'] }
+  }
+  return { folders: [...new Set([...BIN_CANDIDATES, ...path.split(':').filter(dir => dir.startsWith('/'))])] }
 }
 
 async function has($: Engine, file: string): Promise<boolean> {
@@ -97,15 +122,30 @@ export async function findToolchain($: Engine, backend: Backend, folders: string
 // Empty when kpsewhich cannot run: the compiles themselves then say.
 export async function missingFiles($: Engine, toolchain: Toolchain, font: string | null): Promise<string[]> {
   if (!toolchain.kpsewhich) return []
-  const fontFile = font ? FONT_FILES[font] : undefined
-  const wanted = fontFile && !REQUIRED_FILES.includes(fontFile) ? [...REQUIRED_FILES, fontFile] : REQUIRED_FILES
+  const fontFiles = (font ? FONT_FILES[font] : undefined) ?? []
+  const wanted = [...new Set([...REQUIRED_FILES, ...fontFiles])]
   const run = await $.process.run([toolchain.kpsewhich, ...wanted], { timeoutMs: 15000 }).catch(() => null)
   if (!run) return []
   const found = new Set(run.stdout.split('\n').map(line => line.trim().split('/').pop()))
   return wanted.filter(file => !found.has(file))
 }
 
+// What TeX's own settings say: the folders a sandbox must let it reach.
+export async function texVariable($: Engine, toolchain: Toolchain, name: string): Promise<string> {
+  if (!toolchain.kpsewhich) return ''
+  const run = await $.process.run([toolchain.kpsewhich, `-var-value=${name}`], { timeoutMs: 10000 }).catch(() => null)
+  return run?.exitCode === 0 ? run.stdout.trim() : ''
+}
+
+export async function versionOf($: Engine, toolchain: Toolchain): Promise<string> {
+  const run = await $.process.run([toolchain.typesetter, '--version'], { timeoutMs: 10000 }).catch(() => null)
+  return run?.stdout.split('\n')[0]?.trim() ?? ''
+}
+
 export type Platform = 'mac' | 'linux' | 'windows' | 'other'
+// How this machine installs TeX packages: TeX Live's own tlmgr, or the
+// system's package manager for a distribution's TeX Live.
+export type Installer = 'tlmgr' | 'apt' | 'dnf' | 'pacman' | null
 
 export async function platformOf($: Engine): Promise<Platform> {
   if (await has($, '/usr/bin/sw_vers')) return 'mac'
@@ -113,18 +153,36 @@ export async function platformOf($: Engine): Promise<Platform> {
   return (await $.env.get('WINDIR').catch(() => undefined)) ? 'windows' : 'other'
 }
 
+// A TeX Live installed from tug.org keeps tlmgr beside latex; one from the
+// distribution lives in /usr/bin and comes from its package manager.
+export async function installerOf($: Engine, platform: Platform, toolchain: Toolchain | null): Promise<Installer> {
+  if (toolchain && toolchain.bin !== '/usr/bin' && (await has($, `${toolchain.bin}/tlmgr`))) return 'tlmgr'
+  if (platform === 'mac') return 'tlmgr'
+  if (platform !== 'linux') return null
+  if (await has($, '/usr/bin/apt-get')) return 'apt'
+  if (await has($, '/usr/bin/dnf')) return 'dnf'
+  if (await has($, '/usr/bin/pacman')) return 'pacman'
+  return null
+}
+
 // How to get a working toolchain here: one command to run.
-export function installHint(platform: Platform, missing: string[], hasToolchain: boolean): string {
-  const fonts = missing.some(file => Object.values(FONT_FILES).includes(file) && !REQUIRED_FILES.includes(file))
-  if (hasToolchain && missing.length) {
-    if (platform === 'mac') return `sudo tlmgr install ${missing.map(file => file.replace(/\.(sty|cls)$/, '')).join(' ')}`
-    if (platform === 'linux') return `sudo apt install texlive-latex-extra texlive-pictures texlive-science${fonts ? ' texlive-fonts-extra' : ''}`
-    return `Install the LaTeX packages: ${missing.join(', ')}`
+export function installHint(o: { platform: Platform; installer: Installer; missing: string[]; hasToolchain: boolean; backend: Backend; fontChosen: boolean }): string {
+  const fonts = o.fontChosen || o.missing.some(file => !REQUIRED_FILES.includes(file))
+  const xetex = o.backend === 'xelatex'
+  if (o.hasToolchain && o.missing.length) {
+    const packages = [...new Set(o.missing.map(packageOf))]
+    if (o.installer === 'tlmgr') return `sudo tlmgr install ${packages.join(' ')}`
+    if (o.installer === 'apt') return `sudo apt install texlive-latex-extra texlive-pictures texlive-science${fonts ? ' texlive-fonts-extra' : ''}`
+    if (o.installer === 'dnf') return `sudo dnf install ${packages.map(name => `texlive-${name}`).join(' ')}`
+    if (o.installer === 'pacman') return `sudo pacman -S texlive-latexextra texlive-pictures texlive-science${fonts ? ' texlive-fontsextra' : ''}`
+    return `Install the LaTeX packages: ${packages.join(', ')}`
   }
-  if (platform === 'mac') return 'brew install --cask mactex-no-gui'
-  if (platform === 'linux') return 'sudo apt install texlive-latex-extra texlive-pictures texlive-science dvisvgm'
-  if (platform === 'windows') return 'Install MiKTeX or TeX Live, which include latex and dvisvgm'
-  return 'Install TeX Live, which includes latex and dvisvgm'
+  if (o.platform === 'mac') return `brew install --cask mactex-no-gui`
+  if (o.installer === 'apt') return `sudo apt install texlive-latex-extra texlive-pictures texlive-science dvisvgm${xetex ? ' texlive-xetex' : ''}${fonts ? ' texlive-fonts-extra' : ''}`
+  if (o.installer === 'dnf') return `sudo dnf install texlive-scheme-medium texlive-dvisvgm texlive-standalone${xetex ? ' texlive-xetex' : ''}`
+  if (o.installer === 'pacman') return `sudo pacman -S texlive-latexextra texlive-pictures texlive-science texlive-binextra${xetex ? ' texlive-xetex' : ''}${fonts ? ' texlive-fontsextra' : ''}`
+  if (o.platform === 'windows') return 'Install MiKTeX or TeX Live, which include latex and dvisvgm'
+  return 'Install TeX Live (https://tug.org/texlive), which includes latex and dvisvgm'
 }
 
 // What the setup check found, for the settings pane and /latex setup.
@@ -132,9 +190,16 @@ export type SetupReport = {
   backend: Backend
   toolchain: Toolchain | null
   folders: string[]
+  // Why the folders could not be searched: a TeX folder setting that is
+  // not an absolute path.
+  problem?: string
   missing: string[]
+  // Whether TeX runs in a sandbox, and its description.
+  isSandboxed: boolean
   sandbox: string
   platform: Platform
+  installer: Installer
+  fontChosen: boolean
   macros: { path: string; count: number; error?: string; exists: boolean }
 }
 
@@ -143,10 +208,14 @@ export function describeSetup(report: SetupReport): string[] {
   const { toolchain } = report
   if (report.backend === 'mathjax') lines.push('Backend: MathJax only. LaTeX blocks stay code and the LaTeX fonts are off.')
   else if (toolchain) lines.push(`Backend: ${toolchain.engine} in ${toolchain.bin}`)
+  else if (report.problem) lines.push(`Backend: ${report.problem}, so math uses MathJax and blocks stay code.`)
   else lines.push(`Backend: no ${report.backend === 'auto' ? 'latex or xelatex' : report.backend} with dvisvgm found, so math uses MathJax and blocks stay code. Looked in ${report.folders.join(', ')}.`)
   if (toolchain) lines.push(report.missing.length ? `Missing LaTeX packages: ${report.missing.join(', ')}` : 'LaTeX packages: all found')
-  if (report.backend !== 'mathjax' && (!toolchain || report.missing.length)) lines.push(`To fix: ${installHint(report.platform, report.missing, toolchain !== null)}`)
+  if (report.backend !== 'mathjax' && !report.problem && (!toolchain || report.missing.length)) {
+    lines.push(`To fix: ${installHint({ ...report, hasToolchain: toolchain !== null })}`)
+  }
   if (toolchain) lines.push(`Sandbox: ${report.sandbox}`)
+  if (toolchain && !report.isSandboxed && report.platform === 'linux') lines.push('To fix: install bubblewrap (bwrap) from your distribution, then Check again')
   const { macros } = report
   if (!macros.exists) lines.push(`Macros: no file at ${macros.path}`)
   else lines.push(`Macros: ${macros.count} definition${macros.count === 1 ? '' : 's'} from ${macros.path}${macros.error ? `, with an error: ${macros.error}` : ''}`)

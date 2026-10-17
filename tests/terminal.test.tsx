@@ -1,6 +1,8 @@
 import type { PromptEditInput, PromptEditResult } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 import { promptDecorations } from '../hooks/prompt'
+import { bwrapArgv, outermost } from '../hooks/sandbox'
+import { installHint, searchFolders } from '../hooks/setup'
 import { DARK_STYLE } from '../hooks/style'
 import { readMacros, texToUnicode, texToUnicodeLines } from '../hooks/unicode'
 
@@ -160,4 +162,32 @@ test('a link in a terminal line keeps its address', async $ => {
   const ui = await $.ui.mount({ plugin: 'latex', surface: 'terminal', component: 'AssistantMessage', props: reply('See [the docs](https://example.com/a) for $x^2$.') })
   expect(await ui.find({ type: 'Link' })).toEqual(expect.objectContaining({ props: expect.objectContaining({ href: 'https://example.com/a' }) }))
   await ui.unmount()
+})
+
+test('the setup check takes only an absolute TeX folder, or a path to latex itself', () => {
+  expect(searchFolders('texlive/bin', '', '/Users/me').problem).toContain('not an absolute path')
+  expect(searchFolders('~/texlive/bin/', '', '/Users/me').folders).toEqual(['/Users/me/texlive/bin'])
+  expect(searchFolders('/usr/bin/latex', '', '/Users/me').folders).toEqual(['/usr/bin'])
+  expect(searchFolders('', '/a/bin:relative:/b/bin', '/Users/me').folders).toContain('/b/bin')
+  expect(searchFolders('', '/a/bin:relative', '/Users/me').folders).not.toContain('relative')
+})
+
+test('install hints name the TeX Live packages, not the files', () => {
+  const missing = ['tikz.sty', 'bm.sty', 'newpxmath.sty', 'standalone.cls']
+  expect(installHint({ platform: 'mac', installer: 'tlmgr', missing, hasToolchain: true, backend: 'auto', fontChosen: true })).toBe('sudo tlmgr install pgf tools newpx standalone')
+  expect(installHint({ platform: 'linux', installer: 'apt', missing, hasToolchain: true, backend: 'auto', fontChosen: true })).toContain('texlive-fonts-extra')
+  expect(installHint({ platform: 'linux', installer: 'apt', missing: [], hasToolchain: false, backend: 'xelatex', fontChosen: false })).toContain('texlive-xetex')
+  expect(installHint({ platform: 'linux', installer: 'dnf', missing: ['tikz.sty'], hasToolchain: true, backend: 'auto', fontChosen: false })).toBe('sudo dnf install texlive-pgf')
+})
+
+test('a bwrap sandbox hides every home, binds the cache read-only and lets a run write only its folder', () => {
+  const argv = bwrapArgv({ kind: 'bwrap', bwrap: '/usr/bin/bwrap', hidden: outermost(['/home/me', '/home', '/mnt']), readable: ['/home/me/.cache/claude-latex'], writable: [] }, ['latex', 'd.tex'], '/home/me/.cache/claude-latex/build/b-1')
+  const text = argv.join(' ')
+  expect(text).toContain('--tmpfs /home --tmpfs /mnt')
+  expect(text).not.toContain('--tmpfs /home/me')
+  expect(text).toContain('--ro-bind-try /home/me/.cache/claude-latex /home/me/.cache/claude-latex')
+  expect(text).toContain('--bind /home/me/.cache/claude-latex/build/b-1 /home/me/.cache/claude-latex/build/b-1 --chdir /home/me/.cache/claude-latex/build/b-1')
+  expect(text).toContain('--unshare-net')
+  // The writable folder is bound after the read-only cache, so it wins.
+  expect(text.indexOf('--bind /home/me/.cache/claude-latex/build')).toBeGreaterThan(text.indexOf('--ro-bind-try /home/me/.cache/claude-latex'))
 })

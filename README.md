@@ -171,7 +171,8 @@ Diagrams can be a little slow i.e 0.4 to 0.7 seconds to compile the first time a
 Claude writes the LaTeX blocks, so a reply could try to make LaTeX read or write your files. The mod treats every block as untrusted:
 
 - Shell escape is off (`-no-shell-escape`).
-- Every `latex` and `dvisvgm` run goes through a sandbox: `sandbox-exec` on macOS, [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) on Linux. The sandbox blocks reading your home folder apart from TeX's own folders and the mod's cache, blocks writing anywhere else, and blocks the network. `/latex setup` says which one is on.
+- Every `latex` and `dvisvgm` run goes through a sandbox: `sandbox-exec` on macOS, [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) on Linux. The sandbox blocks reading your home folder apart from TeX's own folders, your fonts and the mod's cache, lets each run write only its own folder, and blocks the network. `/latex setup` says which one is on.
+- dvisvgm runs no PostScript from a block (`--no-specials=ps`).
 - TeX's own `openout_any=p` blocks writing outside the build folder.
 - A compile is stopped after 60 seconds.
 - A drawing over the app's 128 KB limit shows an error on that block instead of breaking the message.

@@ -178,6 +178,7 @@ function fakeTex(on: On, pages = 1, missing: string[] = []) {
   const files = new Map<string, string>()
   const runs: string[][] = []
   const sandboxed: boolean[] = []
+  const workdirs: string[] = []
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('fs.exists', async ($, e) => ({ value: e.path.startsWith('/Library/TeX/texbin/') || files.has(e.path) }))
   on('fs.write', async ($, e) => {
@@ -194,7 +195,11 @@ function fakeTex(on: On, pages = 1, missing: string[] = []) {
     // Compiles run inside sandbox-exec: look at the command it wraps.
     const isSandboxed = e.argv[0] === '/usr/bin/sandbox-exec'
     if (isSandboxed) sandboxed.push(true)
-    const argv = isSandboxed ? e.argv.slice(3) : [...e.argv]
+    // sandbox-exec -D WORKDIR=<folder> -f <profile> <command...>
+    const argv = isSandboxed ? e.argv.slice(e.argv.indexOf('-f') + 2) : [...e.argv]
+    if (isSandboxed) workdirs.push(e.argv.find(a => a.startsWith('WORKDIR='))?.slice(8) ?? '')
+    // The setup check asks each program its version: not a compile.
+    if (argv.includes('--version')) return { value: { exitCode: 0, stdout: 'pdfTeX 3.141592653 (TeX Live 2026)\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     runs.push(argv)
     e = { ...e, argv }
     const cwd = e.init?.cwd ?? ''
@@ -221,7 +226,7 @@ function fakeTex(on: On, pages = 1, missing: string[] = []) {
     }
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  return { files, runs, sandboxed }
+  return { files, runs, sandboxed, workdirs }
 }
 
 test('a LaTeX block redraws by itself once compiled', async ($, on) => {
@@ -329,6 +334,44 @@ test('the xelatex backend writes XDV and hands it to dvisvgm', { options: { back
   // Its saved formats are its own: a latex format would not load.
   expect(runs.find(argv => argv.includes('-ini'))).toContain('&xelatex')
   expect(await ui.findAll({ type: 'Svg' })).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('a TeX run may write only its own folder, and dvisvgm runs no PostScript', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/Users/test', PATH: '' })
+  const { runs, workdirs, files } = fakeTex(on)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  // The profile lets a run write its WORKDIR, never the whole cache.
+  const profile = files.get('/Users/test/.cache/claude-latex/sandbox.sb') ?? ''
+  expect(profile).toContain('(param "WORKDIR")')
+  expect(profile).not.toMatch(/allow file-write\* \(subpath "\/Users\/test\/\.cache\/claude-latex"\)/)
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('```tikz\n\\draw (0,0) -- (1,1);\n```') })
+  for (let i = 0; i < 3; i++) await clock.advance(100)
+  expect(runs.find(argv => argv[0]?.endsWith('/dvisvgm'))).toContain('--no-specials=ps')
+  // Compiles write their build folder; formats are built in the formats folder.
+  expect(workdirs.some(dir => /\/build\/b-/.test(dir))).toBe(true)
+  expect(workdirs.every(dir => /\/(build\/[^/]+|formats)$/.test(dir))).toBe(true)
+  await ui.unmount()
+})
+
+test('a font changed after the workers start compiles in the font its key says', { options: { mathFont: 'palatino' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/Users/test', PATH: '' })
+  on('ui.log', async () => ({ value: undefined }))
+  // First the font's package is missing, so the workers start with MathJax.
+  const missing = ['newpxmath.sty']
+  const { runs } = fakeTex(on, 1, missing)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  // Then it is installed, and the check runs again.
+  missing.length = 0
+  await $.command.run({ command: 'latex', args: 'setup' } as never)
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('Now $a^2$.') })
+  for (let i = 0; i < 3; i++) await clock.advance(100)
+  const math = runs.find(argv => argv[0]?.endsWith('/latex') && !argv.includes('-ini') && argv.includes('d.tex'))
+  expect(math).toBeDefined()
   await ui.unmount()
 })
 
