@@ -12,7 +12,8 @@ export type TextSpan = {
   href?: string
 }
 export type Span = TextSpan | { kind: 'math'; tex: string }
-export type Line = { prefix: string; heading: boolean; spans: Span[]; quote?: boolean }
+// `level` is a heading's level, 1 to 6.
+export type Line = { prefix: string; heading: boolean; spans: Span[]; quote?: boolean; level?: number }
 export type Align = 'left' | 'center' | 'right'
 export type Piece =
   | { kind: 'md'; text: string }
@@ -379,6 +380,7 @@ export function parseLine(raw: string): Line {
     text = text.slice((indent[1] ?? '').length)
   }
   const line: Line = { prefix, heading, spans: spansOf(scan(text), heading) }
+  if (h) line.level = h[0].trim().length
   if (quote && !h && !bullet && !number) line.quote = true
   return line
 }

@@ -1,8 +1,8 @@
 {
   "name": "latex",
   "displayName": "LaTeX",
-  "version": "0.5.0",
-  "description": "Render TeX math, TikZ diagrams and LaTeX blocks in Claude Code's desktop app, in any of 10 LaTeX fonts, with every LaTeX compile sandboxed",
+  "version": "0.6.0",
+  "description": "Render TeX math, TikZ diagrams and LaTeX blocks in Claude Code's desktop app, in any of 10 LaTeX fonts, with every LaTeX compile sandboxed. In the terminal, math shows as Unicode and the prompt box previews it as you type",
   "author": {
     "name": "Zaahir Ali"
   },
@@ -44,6 +44,18 @@
       "type": "boolean",
       "title": "Tell the model how math renders here",
       "description": "Add a short note to the system prompt, where the mod draws: the syntax that renders, what a code block compiles, and the size limits of one reply.",
+      "default": true
+    },
+    "terminal": {
+      "type": "boolean",
+      "title": "Math in the terminal",
+      "description": "When Claude Code runs in a terminal, show the math in replies as Unicode text: inline formulas in the line, display formulas laid out over several rows.",
+      "default": true
+    },
+    "promptBox": {
+      "type": "boolean",
+      "title": "Style the prompt box",
+      "description": "Color the Markdown you type in the terminal's prompt box the way render-markdown.nvim does, and preview each $...$ formula as Unicode beside it.",
       "default": true
     },
     "copyButton": {

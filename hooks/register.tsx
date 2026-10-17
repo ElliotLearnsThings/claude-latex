@@ -3,6 +3,10 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import { definePreamble, renderTex, withInk, type ColorScheme } from './math'
 import { drawMessage } from './draw'
 import { keepLineBreaks, looksLikeMarkdown, looksLikeMath, mathOnly, parse } from './parse'
+import { promptDecorations } from './prompt'
+import { DARK_STYLE, isLightTerminal, LIGHT_STYLE } from './style'
+import { drawTerminal } from './terminal'
+import { readMacros, texToUnicode, texToUnicodeLines } from './unicode'
 import {
   BIN_CANDIDATES,
   documentForBlock,
@@ -28,7 +32,8 @@ import {
   type TexDoc,
 } from './texjobs'
 
-// Draws messages in the desktop Code tab with TeX rendered.
+// Draws messages in the desktop Code tab with TeX rendered, and in the
+// terminal with TeX as Unicode text.
 // $$...$$, \[...\] and equation/align environments become centered SVG blocks
 // with a Copy TeX button. A paragraph with $...$ or \(...\) is laid out word
 // by word, each formula an inline SVG sitting on the text's baseline.
@@ -36,6 +41,10 @@ import {
 // TeX install then typesets each formula in that font and the drawing swaps.
 // ```tikz, ```tikzcd and ```latex blocks are compiled with the local TeX.
 // Everything else stays the app's own Markdown.
+// In the terminal, inline math runs in the line as Unicode and display math
+// is laid out over several rows (hooks/unicode.ts). The prompt box paints
+// the draft's Markdown and previews each formula as it is typed
+// (hooks/prompt.ts), in the colors of render-markdown.nvim (hooks/style.ts).
 
 // Goes up each time a compile finishes. Every message that draws math
 // reads it, so writing it redraws exactly those messages.
@@ -73,6 +82,16 @@ A mod draws TeX in your replies here. Write math as TeX, never as Unicode symbol
 - A display formula wider than the window is scaled down to fit. Break a long one over lines with aligned or split.
 - Dollar amounts such as $5 and $10 are left as text. Write \\$ where a dollar sign could be read as math.
 - The app may show text written between tool calls only as a short summary. Put math the user must see in the final message of a turn.`
+
+// The same note for a terminal, where the mod turns TeX into Unicode text.
+const TERMINAL_NOTE = `# Math in this terminal (LaTeX mod)
+
+A mod shows TeX in your replies as Unicode text here. Write math as TeX, never as Unicode symbols in plain text.
+
+- Inline math: $...$ or \\(...\\), drawn in the line: \\alpha^2 + \\frac{1}{2} reads α² + ½. Keep inline formulas short: anything tall is flattened onto one line.
+- Display math: $$...$$, \\[...\\], or an align, gather, cases or matrix environment. It is laid out over several rows: fractions stacked, sums with their bounds above and below, matrices with tall brackets, align rows lined up.
+- A \`\`\`tikz, \`\`\`tikzcd or \`\`\`latex block is not compiled in a terminal. It shows as code. Draw a diagram only when asked.
+- Dollar amounts such as $5 and $10 are left as text. Write \\$ where a dollar sign could be read as math.`
 
 // What the app's own row says under a rendered message of yours. The row is
 // there for its controls.
@@ -228,6 +247,11 @@ async function setupSandbox($: Engine, home: string): Promise<void> {
   else $.ui.log('latex: could not sandbox LaTeX here, so LaTeX blocks run without a sandbox', { to: 'debug' })
 }
 let macros = ''
+// The macros file's definitions, read for the Unicode conversion.
+let unicodeMacros = readMacros('')
+// The colors the terminal and the prompt box use, picked at session start
+// when the setting follows the system.
+let terminalStyle = DARK_STYLE
 
 async function findTex($: Engine, home: string, path: string): Promise<boolean> {
   for (const dir of [...BIN_CANDIDATES, ...path.split(':').filter(Boolean)]) {
@@ -403,6 +427,9 @@ export const register: Register = (on, options) => {
   const bubbleMode: BubbleMode = BUBBLE_MODES.find(mode => mode === options.userBubble) ?? 'off'
   const showCopy = options.copyButton === true
   const tellModel = options.tellModel !== false
+  const terminalOn = options.terminal !== false
+  const promptOn = options.promptBox !== false
+  terminalStyle = scheme === 'light' ? LIGHT_STYLE : DARK_STYLE
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -412,6 +439,7 @@ export const register: Register = (on, options) => {
       const home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
       debugDir = home ? `${home}/.cache/claude-latex/debug` : ''
       debug($, `session start, options ${JSON.stringify(options)}`)
+      if (scheme === 'auto') terminalStyle = isLightTerminal(await $.env.get('COLORFGBG').catch(() => undefined)) ? LIGHT_STYLE : DARK_STYLE
 
       if (blocksOn || latexFont) {
         let ready = false
@@ -448,6 +476,7 @@ export const register: Register = (on, options) => {
         const macrosPath = String(options.macrosFile || '~/.claude/latex-macros.tex').replace(/^~(?=\/)/, home)
         if (await $.fs.exists(macrosPath)) {
           macros = await $.fs.read(macrosPath)
+          unicodeMacros = readMacros(macros)
           const error = definePreamble(macros)
           if (error) $.ui.log(`latex: ${macrosPath}: ${error}`)
         }
@@ -483,9 +512,21 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const drawsHere = e.surfaces.some(surface => surface === 'desktop' || surface === 'mobile')
-    if (!tellModel || !drawsHere) return composed
-    return { sections: [...composed.sections, { id: 'latex:rendering', text: MODEL_NOTE, scope: 'session' as const }] }
+    const inTerminal = terminalOn && e.surfaces.includes('terminal')
+    if (!tellModel || !(drawsHere || inTerminal)) return composed
+    // Where the app also draws (the desktop through Remote Control), the
+    // desktop's note says what renders best.
+    const note = drawsHere ? MODEL_NOTE : TERMINAL_NOTE
+    return { sections: [...composed.sections, { id: 'latex:rendering', text: note, scope: 'session' as const }] }
   })
+
+  // The prompt box: each edit's answer carries the paint for the draft as it
+  // now stands.
+  on('prompt.edit', async ($, e, next) => {
+    const edited = await next(e)
+    if (!promptOn) return edited
+    return { ...edited, decorations: [...(edited.decorations ?? []), ...promptDecorations(edited.text, terminalStyle, unicodeMacros)] }
+  }).catch(async ($, e, next) => next(e))
 
   on('command.run', { command: 'latex' }, async $ => {
     await $.ui.open({ id: PANE, title: 'LaTeX settings' })
@@ -493,9 +534,54 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: ['AssistantMessage', 'UserMessage'] }, async ($, e, next) => {
-    if (e.surface !== 'desktop' && e.surface !== 'mobile') return next(e)
+    if (e.surface !== 'desktop' && e.surface !== 'mobile' && e.surface !== 'terminal') return next(e)
     const renderStarted = Date.now()
     try {
+    if (e.surface === 'terminal') {
+      if (!terminalOn) return next(e)
+      const isUser = e.component === 'UserMessage'
+      if (isUser && (e.props.task || e.props.from || !OWN_MESSAGES.has(e.props.origin.kind))) return next(e)
+      const mode = !isUser ? 'reply' : bubbleMode
+      if (mode === 'off') return next(e)
+      const text = isUser ? keepLineBreaks(e.props.text) : e.props.text
+      const isMarkdownToo = mode === 'rendered' && looksLikeMarkdown(text)
+      if (!looksLikeMath(text) && !isMarkdownToo) return next(e)
+      // Nothing compiles here: LaTeX blocks stay code blocks.
+      let pieces = parse(text, { blocks: false })
+      if (mode === 'under') pieces = mathOnly(pieces)
+      if (!pieces.some(p => p.kind !== 'md') && !isMarkdownToo) return next(e)
+      const { Box, Text, Markdown } = $.ui.resolve(e)
+      const tree = drawTerminal(pieces, {
+        el: { Box, Text, Markdown },
+        style: terminalStyle,
+        inline: tex => texToUnicode(tex, unicodeMacros),
+        display: tex => texToUnicodeLines(tex, unicodeMacros),
+      })
+      debug($, `drew ${e.component} ${e.props.text.length} chars in the terminal as ${mode}: pieces ${pieces.map(p => p.kind[0]).join('')}, ${Date.now() - renderStarted} ms`)
+      // `under` keeps the app's row and adds the math below it. `rendered`
+      // draws the message in place of the row, behind the prompt mark.
+      if (mode === 'under') {
+        return (
+          <Box flexDirection="column">
+            {await next(e)}
+            <Box flexDirection="column" marginLeft={2}>
+              {tree}
+            </Box>
+          </Box>
+        )
+      }
+      if (mode === 'rendered') {
+        return (
+          <Box flexDirection="row">
+            <Text color={terminalStyle.muted}>{'❯ '}</Text>
+            <Box flexDirection="column" flexShrink={1}>
+              {tree}
+            </Box>
+          </Box>
+        )
+      }
+      return tree
+    }
     const isUser = e.component === 'UserMessage'
     if (isUser && (e.props.task || e.props.from || !OWN_MESSAGES.has(e.props.origin.kind))) return next(e)
     const text = isUser ? keepLineBreaks(e.props.text) : e.props.text
@@ -672,7 +758,9 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column">
         <Text bold>LaTeX mod is on</Text>
         <Text dimColor>
-          Math, TikZ and LaTeX blocks in replies now render. You can pick one of 10 math fonts, and choose whether your own messages show their math.
+          {e.surface === 'terminal'
+            ? 'Math in replies now shows as Unicode text, laid out over several rows for display math. The prompt box colors your Markdown and previews each formula as you type.'
+            : 'Math, TikZ and LaTeX blocks in replies now render. You can pick one of 10 math fonts, and choose whether your own messages show their math.'}
         </Text>
         <Box flexDirection="row" gap={1}>
           <Button
@@ -706,6 +794,8 @@ export const register: Register = (on, options) => {
     const setTellModel = (value: boolean) => saved($.config.set({ key: 'latex.tellModel', value: value }))
     const setCopyButton = (value: boolean) => saved($.config.set({ key: 'latex.copyButton', value: value }))
     const setTikz = (value: boolean) => saved($.config.set({ key: 'latex.tikz', value: value }))
+    const setTerminal = (value: boolean) => saved($.config.set({ key: 'latex.terminal', value: value }))
+    const setPromptBox = (value: boolean) => saved($.config.set({ key: 'latex.promptBox', value: value }))
     const toggle = (field: string, label: string, help: string, isOn: boolean, change: (value: boolean) => void) => (
       <Box flexDirection="column" marginBottom={1}>
         <Box flexDirection="row" gap={1}>
@@ -767,6 +857,8 @@ export const register: Register = (on, options) => {
         {toggle('tellModel', 'Tell the model how math renders here', 'Adds a short note to the system prompt: the syntax that renders, and the size limits.', tellModel, setTellModel)}
         {toggle('copyButton', 'Copy TeX button', 'A button under each display formula and LaTeX block.', showCopy, setCopyButton)}
         {toggle('tikz', 'Compile LaTeX blocks', 'tikz, tikzcd and latex code blocks, using your TeX install.', blocksOn, setTikz)}
+        {toggle('terminal', 'Math in the terminal', 'Show math in replies as Unicode text when Claude Code runs in a terminal.', terminalOn, setTerminal)}
+        {toggle('promptBox', 'Style the prompt box', 'Color the Markdown you type, render-markdown.nvim style, and preview each formula as Unicode beside it.', promptOn, setPromptBox)}
         <Text dimColor>Macros file: {String(options.macrosFile || '~/.claude/latex-macros.tex')}. Reopen this pane with /latex.</Text>
       </Box>
     )

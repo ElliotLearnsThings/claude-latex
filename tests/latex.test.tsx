@@ -316,8 +316,13 @@ test('tells the model how math renders, where the mod draws', async ($, on) => {
   const note = onDesktop.sections.find(section => section.id === 'latex:rendering')
   expect(note?.text).toContain('235 KB')
   expect(note?.text).toContain('```tex')
+  // In a terminal the note says math shows as Unicode, and blocks as code.
   const inTerminal = await $.prompt.compose({ ...facts, surfaces: ['terminal'] } as never)
-  expect(inTerminal.sections.map(section => section.id)).toEqual(['intro'])
+  const terminalNote = inTerminal.sections.find(section => section.id === 'latex:rendering')
+  expect(terminalNote?.text).toContain('Unicode')
+  expect(terminalNote?.text).not.toContain('235 KB')
+  const headless = await $.prompt.compose({ ...facts, surfaces: [] } as never)
+  expect(headless.sections.map(section => section.id)).toEqual(['intro'])
 })
 
 test('the note to the model can be turned off', { options: { tellModel: false } }, async ($, on) => {
@@ -365,7 +370,7 @@ test('the settings pane changes the real settings', async ($, on) => {
   on('config.list', async () => ({ value: [{ key: 'latex.copyButton', label: 'Copy TeX button', kind: 'boolean', value: false, provider: { kind: 'plugin', name: 'latex' }, isLocked: false }] as never }))
   on('config.set', async ($, e) => {
     sets.push(e)
-    return { value: { value: e.value } as never }
+    return { value: e.value }
   })
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
   const pane = await $.ui.mount<'desktop', 'Pane'>({ plugin: 'latex', surface: 'desktop', component: 'Pane', props: { title: 'LaTeX settings', isFocused: true, bodyColumns: 60, placement: 'dock' } as never, requestId: 'latex-settings' } as never)
